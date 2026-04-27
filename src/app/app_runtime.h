@@ -3,28 +3,9 @@
 #include <string>
 
 #include "core/element_factory.h"
+#include "core/project_model.h"
 
 namespace app {
-
-// Request that the active AppRuntime add a child of the given kind to the
-// currently selected element. Safe to call from any UI code; no-op if no
-// runtime is active or no element is selected.
-void RequestAddChild(core::NewElementKind kind);
-
-// Request that the active AppRuntime remove the currently selected element
-// using the given mode. If the planned removal targets a single element it is
-// removed immediately; otherwise the targeted nodes are highlighted on the
-// canvas, the view fits to them, and a confirmation modal is shown.
-void RequestRemove(core::RemoveMode mode);
-
-// Request that the active AppRuntime show a "not implemented yet" status for
-// the given feature name.
-void RequestNotImplemented(const char* feature);
-
-// Returns a pointer to the currently loaded assurance case, or nullptr if no
-// case is loaded. Used by UI menus that need to compute model-derived labels
-// (e.g. the Remove submenu's element counts) without owning model access.
-const parser::AssuranceCase* GetActiveAssuranceCase();
 
 class AppRuntime {
 public:
@@ -39,6 +20,9 @@ public:
     // Add a new child element to the currently selected element.
     // Returns true on success; updates selection to the new element.
     bool AddChildToSelected(core::NewElementKind kind);
+
+    // Add a new top-level Goal (root claim) to the current model.
+    bool AddTopGoal();
 
     // Remove the currently selected element using the given mode. If the
     // planned removal targets more than one element, opens the confirmation
@@ -58,12 +42,28 @@ private:
     float RenderMainMenuBar(bool& done);
     void ScanDirectory();
     void RenderSplitters(float display_w, float content_h, float left_w, float center_w, float top_y);
-    void RenderTreePanel(float left_w, float top_left_h, float top_y);
-    void RenderSacmViewerPanel(float left_w, float top_left_h, float bottom_left_h, float top_y);
+    void RenderTreePanel(float left_w, float safety_tree_h, float top_y);
+    void RenderSacmViewerPanel(float left_w, float sacm_h, float top_y);
     void RenderCenterPanel(float center_x, float center_w, float content_h, float top_y);
     void RenderElementPropertiesPanel(float center_x, float center_w, float right_w, float content_h, float top_y);
+    void RenderStartupProjectWindow();
     void RenderNotImplementedModal();
     void RenderRemoveConfirmModal();
+    void RenderCreateProjectModal();
+    void RenderOpenProjectModal();
+    void RenderProjectFileNameModal();
+    void RenderProjectLoadReportModal();
+    void RenderSaveBeforeExitModal(bool& done);
+
+    void BeginCreateProject();
+    void BeginOpenProject();
+    void BeginCreateProjectSacmFile();
+    void BeginCreateProjectEvidenceRegister();
+    void BeginCreateProjectJ3377CaeRegister();
+    void OpenProjectFile(const core::ProjectFileEntry& entry);
+    bool OpenFirstProjectSacmFile();
+    bool SaveProject();
+    void RequestExit(bool& done);
 
     void RebuildDerivedViewsIfNeeded();
 

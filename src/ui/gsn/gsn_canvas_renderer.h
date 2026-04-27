@@ -1,12 +1,15 @@
 #pragma once
 
-#include "gsn_model.h"
+#include "ui/gsn/gsn_model.h"
+#include "parser/xml_parser.h"
+#include "ui/element_context_menu.h"
+#include "ui/ui_state.h"
 #include "core/assurance_tree.h"
 #include <vector>
 #include <unordered_set>
 #include <string>
 
-namespace ui {
+namespace ui::gsn {
 
 class GsnCanvas {
 public:
@@ -16,7 +19,9 @@ public:
     // Set elements (legacy flat list)
     void SetElements(const std::vector<CanvasElement>& elements);
     // Render into the current ImGui window/child
-    void Render();
+    void Render(UiState& ui_state,
+                const parser::AssuranceCase* active_case,
+                const ElementContextActions& actions);
 
     // Zoom controls
     void ZoomIn();
@@ -50,4 +55,4 @@ private:
     ImVec2 view_offset_ = ImVec2(0.0f, 0.0f); // pixel-space pan offset
 };
 
-} // namespace ui
+} // namespace ui::gsn

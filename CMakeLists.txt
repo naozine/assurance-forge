@@ -30,23 +30,30 @@ add_executable(assurance-forge WIN32
     src/app/app_runtime.cpp
     src/app/platform_win32_dx11.cpp
     src/parser/xml_parser.cpp
-    src/ui/gsn_canvas.cpp
-    src/ui/gsn_layout.cpp
-    src/ui/gsn_canvas_renderer.cpp
-    src/ui/gsn_adapter.cpp
+    src/ui/panels/welcome_modal.cpp
+    src/ui/panels/element_panel.cpp
+    src/ui/panels/project_files_panel.cpp
+    src/ui/panels/sacm_viewer_panel.cpp
+    src/ui/widgets/splitter.cpp
+    src/ui/gsn/gsn_canvas.cpp
+    src/ui/gsn/gsn_layout.cpp
+    src/ui/gsn/gsn_canvas_renderer.cpp
+    src/ui/gsn/gsn_adapter.cpp
+    src/ui/element_context_menu.cpp
     src/ui/tree_view.cpp
-    src/ui/element_panel.cpp
     src/ui/register_views.cpp
     src/ui/ui_state.cpp
     src/ui/theme.cpp
     src/core/app_state.cpp
     src/core/assurance_tree.cpp
     src/core/element_factory.cpp
+    src/core/project_model.cpp
+    src/core/project_service.cpp
     src/sacm/sacm_parser.cpp
     src/sacm/sacm_serializer.cpp
 )
 target_include_directories(assurance-forge PRIVATE src)
-target_link_libraries(assurance-forge PRIVATE imgui pugixml)
+target_link_libraries(assurance-forge PRIVATE imgui pugixml bcrypt ole32 shell32)
 
 # --- Tests ---
 include(FetchContent)
@@ -65,14 +72,17 @@ add_executable(tests
     tests/test_layout.cpp
     tests/test_sacm_roundtrip.cpp
     tests/test_element_factory.cpp
+    tests/test_project_service.cpp
     src/parser/xml_parser.cpp
     src/core/assurance_tree.cpp
     src/core/element_factory.cpp
-    src/ui/gsn_layout.cpp
+    src/core/project_model.cpp
+    src/core/project_service.cpp
+    src/ui/gsn/gsn_layout.cpp
     src/sacm/sacm_parser.cpp
     src/sacm/sacm_serializer.cpp
 )
 target_include_directories(tests PRIVATE src)
-target_link_libraries(tests PRIVATE GTest::gtest_main pugixml imgui)
+target_link_libraries(tests PRIVATE GTest::gtest_main pugixml imgui bcrypt)
 include(GoogleTest)
 gtest_discover_tests(tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

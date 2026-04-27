@@ -1,7 +1,6 @@
-#include "ui/gsn_canvas.h"
-#include "ui/gsn_canvas_renderer.h"
+#include "ui/gsn/gsn_canvas.h"
+#include "ui/gsn/gsn_canvas_renderer.h"
 #include "ui/theme.h"
-#include "ui/tree_view.h"
 #include "ui/ui_state.h"
 
 #include <algorithm>
@@ -9,7 +8,7 @@
 #include <cmath>
 #include <iostream>
 
-namespace ui {
+namespace ui::gsn {
 
 // g_BoldFont is defined in gsn_layout.cpp (shared between layout and drawing)
 
@@ -264,15 +263,15 @@ static void ComputeTextRegion(const GsnNode& node, ImVec2 top_left, ImVec2 botto
 static void DrawNodeLabel(ImDrawList* draw_list, const GsnNode& node,
                           ImVec2 top_left, ImVec2 bottom_right,
                           float text_left, float text_wrap, float zoom,
-                          ImU32 ink_color) {
+                          ImU32 ink_color,
+                          const UiState& ui_state) {
     ImFont* bold_font   = g_BoldFont ? g_BoldFont : ImGui::GetFont();
     ImFont* normal_font = ImGui::GetFont();
     float font_size = ImGui::GetFontSize() * zoom;
     float scaled_padding = kTextPadding * zoom;
 
     // Pick label based on language toggle
-    const UiState& state = GetUiState();
-    const std::string& active_label = (state.show_secondary_language && !node.label_secondary.empty())
+    const std::string& active_label = (ui_state.show_secondary_language && !node.label_secondary.empty())
                                       ? node.label_secondary : node.label;
     const char* label_start = active_label.c_str();
     const char* first_newline = strchr(label_start, '\n');
@@ -304,7 +303,12 @@ static void DrawNodeLabel(ImDrawList* draw_list, const GsnNode& node,
 
 // ===== Main node drawing function =====
 
-void DrawGsnNode(const GsnNode& node, ImVec2 canvas_origin, float zoom) {
+void DrawGsnNode(const GsnNode& node,
+                 ImVec2 canvas_origin,
+                 UiState& ui_state,
+                 const parser::AssuranceCase* active_case,
+                 const ElementContextActions& actions,
+                 float zoom) {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     ImVec2 top_left  = ImVec2(canvas_origin.x + node.position.x * zoom,
                               canvas_origin.y + node.position.y * zoom);
@@ -317,7 +321,7 @@ void DrawGsnNode(const GsnNode& node, ImVec2 canvas_origin, float zoom) {
     // If this node is marked for pending removal, override the fill with a
     // strong red tint so the user can see exactly what will be removed.
     const bool marked_for_removal =
-        GetUiState().marked_for_removal.count(node.id) > 0;
+        ui_state.marked_for_removal.count(node.id) > 0;
     if (marked_for_removal) {
         fill_color = GetTheme().danger;
     }
@@ -347,7 +351,7 @@ void DrawGsnNode(const GsnNode& node, ImVec2 canvas_origin, float zoom) {
     float text_left, text_wrap;
     ComputeTextRegion(node, top_left, bottom_right, zoom, text_left, text_wrap);
     ImU32 ink = marked_for_removal ? GetTheme().text_primary : InkOn(fill_color);
-    DrawNodeLabel(draw_list, node, top_left, bottom_right, text_left, text_wrap, zoom, ink);
+    DrawNodeLabel(draw_list, node, top_left, bottom_right, text_left, text_wrap, zoom, ink, ui_state);
     DrawUndevelopedMarker(draw_list, node, top_left, bottom_right, zoom);
 
     // Invisible button for hit-testing.
@@ -357,21 +361,21 @@ void DrawGsnNode(const GsnNode& node, ImVec2 canvas_origin, float zoom) {
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton(node.id.c_str(), scaled_size);
     if (ImGui::IsItemClicked() && !g_overlay_hovered) {
-        GetUiState().selected_element_id = node.id;
+        ui_state.selected_element_id = node.id;
     }
 
     // Right-click context menu: select the node, then offer the Add submenu.
     if (ImGui::BeginPopupContextItem(node.id.c_str())) {
-        GetUiState().selected_element_id = node.id;
-        RenderAddElementMenu();
+        ui_state.selected_element_id = node.id;
+        RenderAddElementMenu(actions);
         ImGui::Separator();
-        RenderRemoveSubmenu();
+        RenderRemoveSubmenu(active_case, ui_state.selected_element_id, actions);
         ImGui::EndPopup();
     }
 
     // Highlight selected node with a soft accent glow ring (3 concentric rects,
     // decreasing alpha) instead of a hard outline.
-    if (GetUiState().selected_element_id == node.id) {
+    if (ui_state.selected_element_id == node.id) {
         const Theme& th_sel = GetTheme();
         for (int i = 0; i < 3; ++i) {
             float pad = 2.0f + (float)i * 2.0f;
@@ -395,7 +399,9 @@ void DrawGsnNode(const GsnNode& node, ImVec2 canvas_origin, float zoom) {
     }
 }
 
-void ShowGsnCanvasContent() {
+void ShowGsnCanvasContent(UiState& ui_state,
+                          const parser::AssuranceCase* active_case,
+                          const ElementContextActions& actions) {
     // Child region with clipping; we manage our own pan/zoom offset
     // so no ImGui scrollbars are needed.
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(GetTheme().canvas_bg));
@@ -447,16 +453,15 @@ void ShowGsnCanvasContent() {
 
         // Center on selected element if requested (e.g. from tree view click)
         {
-            UiState& state = GetUiState();
-            if (state.center_on_selection && !state.selected_element_id.empty()) {
+            if (ui_state.center_on_selection && !ui_state.selected_element_id.empty()) {
                 ImVec2 viewport_size = ImGui::GetWindowSize();
-                renderer.CenterOnNode(state.selected_element_id, viewport_size);
-                state.center_on_selection = false;
+                renderer.CenterOnNode(ui_state.selected_element_id, viewport_size);
+                ui_state.center_on_selection = false;
             }
-            if (state.center_on_marked && !state.marked_for_removal.empty()) {
+            if (ui_state.center_on_marked && !ui_state.marked_for_removal.empty()) {
                 ImVec2 viewport_size = ImGui::GetWindowSize();
-                renderer.CenterOnIds(state.marked_for_removal, viewport_size);
-                state.center_on_marked = false;
+                renderer.CenterOnIds(ui_state.marked_for_removal, viewport_size);
+                ui_state.center_on_marked = false;
             }
         }
 
@@ -526,8 +531,7 @@ void ShowGsnCanvasContent() {
             }
 
             // Language button rect
-            UiState& state_pre = GetUiState();
-            if (state_pre.show_secondary_language || state_pre.model_has_translations) {
+            if (ui_state.show_secondary_language || ui_state.model_has_translations) {
                 float lbw = 36.0f, lbh = 24.0f, lmgn = 12.0f;
                 float lx = child_pos.x + child_size_pre.x - (lbw + lmgn);
                 float ly = child_pos.y + child_size_pre.y - (28.0f + lmgn) - lbh - 6.0f;
@@ -541,13 +545,21 @@ void ShowGsnCanvasContent() {
         }
 
         // Render the canvas content
-        renderer.Render();
+        renderer.Render(ui_state, active_case, actions);
+
+        if (ImGui::BeginPopupContextWindow("##gsn_canvas_background_context",
+                                           ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+            const bool can_add_top_goal = static_cast<bool>(actions.add_top_goal);
+            if (ImGui::MenuItem("Add New Top Goal", nullptr, false, can_add_top_goal)) {
+                actions.add_top_goal();
+            }
+            ImGui::EndPopup();
+        }
 
         // --- Language toggle button above zoom strip (bottom-right) ---
         {
-            UiState& state = GetUiState();
             // Only show when model has translations
-            if (state.show_secondary_language || state.model_has_translations) {
+            if (ui_state.show_secondary_language || ui_state.model_has_translations) {
                 ImVec2 child_size_lang = ImGui::GetWindowSize();
                 float lang_btn_w = 36.0f;
                 float lang_btn_h = 24.0f;
@@ -555,7 +567,7 @@ void ShowGsnCanvasContent() {
                 float lang_x = child_pos.x + child_size_lang.x - (lang_btn_w + lang_margin);
                 float lang_y = child_pos.y + child_size_lang.y - (28.0f + lang_margin) - lang_btn_h - 6.0f;
 
-                ImDrawList* fg_lang = ImGui::GetForegroundDrawList();
+                ImDrawList* fg_lang = ImGui::GetWindowDrawList();
                 fg_lang->AddRectFilled(ImVec2(lang_x - 4.0f, lang_y - 3.0f),
                                        ImVec2(lang_x + lang_btn_w + 4.0f, lang_y + lang_btn_h + 3.0f),
                                        WithAlpha(GetTheme().surface_2, 0.85f), 8.0f);
@@ -566,12 +578,12 @@ void ShowGsnCanvasContent() {
                 ImGui::SetCursorScreenPos(ImVec2(lang_x, lang_y));
                 // Show "EN" when primary, or the active secondary language code (uppercased)
                 char lang_upper[4] = {};
-                const std::string& sl = state.active_secondary_lang;
+                const std::string& sl = ui_state.active_secondary_lang;
                 for (size_t i = 0; i < sl.size() && i < 3; ++i)
                     lang_upper[i] = (char)toupper((unsigned char)sl[i]);
-                const char* lang_label = state.show_secondary_language ? lang_upper : "EN";
+                const char* lang_label = ui_state.show_secondary_language ? lang_upper : "EN";
                 if (ImGui::Button(lang_label, ImVec2(lang_btn_w, lang_btn_h))) {
-                    state.show_secondary_language = !state.show_secondary_language;
+                    ui_state.show_secondary_language = !ui_state.show_secondary_language;
                 }
             }
         }
@@ -581,7 +593,7 @@ void ShowGsnCanvasContent() {
             const char* hint_1 = "Ctrl+Wheel  Zoom";
             const char* hint_2 = "Middle Drag  Pan";
 
-            ImDrawList* fg_hints = ImGui::GetForegroundDrawList();
+            ImDrawList* fg_hints = ImGui::GetWindowDrawList();
             ImVec2 hint_pos(child_pos.x + 12.0f, child_pos.y + 12.0f);
             ImVec2 hint_size(164.0f, 44.0f);
 
@@ -611,7 +623,7 @@ void ShowGsnCanvasContent() {
             float buttons_y = child_pos.y + child_size.y - (button_size + margin);
 
             // Semi-transparent background for the zoom control strip
-            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            ImDrawList* fg = ImGui::GetWindowDrawList();
             float strip_width = button_size * 2 + label_width + 12.0f;
             ImVec2 strip_tl(buttons_x - 4.0f, buttons_y - 2.0f);
             ImVec2 strip_br(buttons_x + strip_width, buttons_y + button_size + 2.0f);
@@ -751,7 +763,8 @@ void ShowGsnCanvasWindow() {
                                   | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     if (ImGui::Begin("GSN Canvas", nullptr, window_flags)) {
-        ShowGsnCanvasContent();
+        ElementContextActions actions{};
+        ShowGsnCanvasContent(GetUiState(), nullptr, actions);
     }
     ImGui::End();
 }
@@ -764,4 +777,4 @@ void SetCanvasTree(const core::AssuranceTree& tree) {
     GlobalRenderer().SetTree(tree);
 }
 
-} // namespace ui
+} // namespace ui::gsn

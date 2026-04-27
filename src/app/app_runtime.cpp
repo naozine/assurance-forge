@@ -1,134 +1,249 @@
 #include "app/app_runtime.h"
+#include "app/platform_win32_dx11.h"
 
 #include "imgui.h"
 
 #include "core/app_state.h"
 #include "core/element_factory.h"
-#include "ui/gsn_canvas.h"
+#include "ui/gsn/gsn_adapter.h"
+#include "ui/gsn/gsn_canvas.h"
+#include "ui/panels/element_panel.h"
+#include "ui/panels/project_files_panel.h"
+#include "ui/panels/sacm_viewer_panel.h"
+#include "ui/panels/welcome_modal.h"
 #include "ui/register_views.h"
 #include "ui/theme.h"
 #include "ui/tree_view.h"
-#include "ui/element_panel.h"
-#include "ui/gsn_adapter.h"
 #include "ui/ui_state.h"
+#include "ui/widgets/splitter.h"
 
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
+#include <iterator>
 #include <string>
-#include <string_view>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <shobjidl.h>
+#endif
 
 namespace app {
 namespace {
 
 constexpr size_t kPathBufferSize = 512;
-constexpr const char* kDefaultDemoFilePath = "data/oasc-ja.xml";
 
 constexpr float kInitialLeftPanelRatio = 0.20f;
 constexpr float kInitialRightPanelRatio = 0.20f;
+constexpr float kInitialProjectBoundaryRatio = 0.50f;
 constexpr float kMinPanelRatio = 0.10f;
 constexpr float kMaxPanelRatio = 0.40f;
 constexpr float kSplitterThickness = 4.0f;
-constexpr float kTopLeftHeightRatio = 0.50f;
-constexpr float kSummaryStripHeight = 88.0f;
-
-// Splitter color comes from the theme (matches app background tier).
-static ImVec4 SplitterColor() {
-    return ImGui::ColorConvertU32ToFloat4(ui::GetTheme().bg_app);
-}
-static ImVec4 SplitterHoverColor() {
-    return ImGui::ColorConvertU32ToFloat4(ui::WithAlpha(ui::GetTheme().accent, 0.55f));
-}
-
-// Element type colors in the SACM viewer list (sourced from theme palette).
-static ImVec4 ElementTypeColor(const char* type) {
-    const ui::Theme& t = ui::GetTheme();
-    if (!type) return ImGui::ColorConvertU32ToFloat4(t.text_primary);
-    std::string_view sv(type);
-    if (sv == "claim")             return ImGui::ColorConvertU32ToFloat4(t.node_claim);
-    if (sv == "argumentreasoning") return ImGui::ColorConvertU32ToFloat4(t.node_strategy);
-    if (sv == "artifact" || sv == "artifactreference")
-        return ImGui::ColorConvertU32ToFloat4(t.node_solution);
-    return ImGui::ColorConvertU32ToFloat4(t.text_primary);
-}
-static ImVec4 SummaryLabelColor() { return ImGui::ColorConvertU32ToFloat4(ui::GetTheme().text_secondary); }
-static ImVec4 SummaryValueColor() { return ImGui::ColorConvertU32ToFloat4(ui::GetTheme().text_primary); }
-
-constexpr float kOverwriteButtonWidth = 130.0f;
+constexpr float kMinLeftSectionHeight = 120.0f;
 
 const ImGuiWindowFlags kPanelFlags = ImGuiWindowFlags_NoMove
                                    | ImGuiWindowFlags_NoResize
                                    | ImGuiWindowFlags_NoCollapse
                                    | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
-void DrawVerticalSplitter(const char* id,
-                          float x,
-                          float width,
-                          float height,
-                          float top_y,
-                          float display_w,
-                          float& ratio,
-                          bool subtract_delta) {
-    ImGui::SetNextWindowPos(ImVec2(x, top_y));
-    ImGui::SetNextWindowSize(ImVec2(width, height));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1, 1));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, SplitterColor());
+enum class ProjectFileCreateKind {
+    Sacm,
+    EvidenceRegister,
+    J3377CaeRegister
+};
 
-    ImGui::Begin(id, nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
-    ImGui::InvisibleButton("##splitter_btn", ImVec2(width, height));
-    bool hovered = ImGui::IsItemHovered() || ImGui::IsItemActive();
-    if (hovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        // Draw a 1px accent stripe down the middle while hovered/dragging.
-        ImVec2 wp = ImGui::GetWindowPos();
-        ImVec2 ws = ImGui::GetWindowSize();
-        float cx = wp.x + ws.x * 0.5f;
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(cx, wp.y), ImVec2(cx, wp.y + ws.y),
-            ImGui::ColorConvertFloat4ToU32(SplitterHoverColor()), 2.0f);
-    }
-
-    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
-        float delta = ImGui::GetIO().MouseDelta.x / display_w;
-        ratio += subtract_delta ? -delta : delta;
-        if (ratio < kMinPanelRatio) ratio = kMinPanelRatio;
-        if (ratio > kMaxPanelRatio) ratio = kMaxPanelRatio;
-    }
-
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(4);
+void CopyToBuffer(char* buffer, size_t buffer_size, const std::string& value) {
+    if (!buffer || buffer_size == 0) return;
+    size_t count = std::min(buffer_size - 1, value.size());
+    std::memcpy(buffer, value.data(), count);
+    buffer[count] = '\0';
 }
 
-int CountElementsOfType(const parser::AssuranceCase& ac, const char* type_a, const char* type_b = nullptr) {
-    int count = 0;
-    for (const auto& elem : ac.elements) {
-        if (elem.type == type_a || (type_b && elem.type == type_b)) {
-            ++count;
-        }
+const char* ProjectFileCreateTitle(ProjectFileCreateKind kind) {
+    switch (kind) {
+        case ProjectFileCreateKind::Sacm: return "New GSN / SACM File";
+        case ProjectFileCreateKind::EvidenceRegister: return "New Evidence Register";
+        case ProjectFileCreateKind::J3377CaeRegister: return "New J3377 CAE Register";
     }
-    return count;
+    return "New Project File";
 }
 
-void SummaryMetric(const char* label, int value) {
-    ImGui::BeginGroup();
-    ImGui::TextColored(SummaryLabelColor(), "%s", label);
-    ImGui::TextColored(SummaryValueColor(), "%d", value);
-    ImGui::EndGroup();
+ImVec4 ColorFromU32(ImU32 color) {
+    return ImGui::ColorConvertU32ToFloat4(color);
 }
+
+#ifdef _WIN32
+enum class FolderBrowseResult {
+    Selected,
+    Cancelled,
+    Failed
+};
+
+std::string WideToUtf8(const wchar_t* wide) {
+    if (!wide) return {};
+    int source_len = static_cast<int>(std::wcslen(wide));
+    if (source_len <= 0) return {};
+    int required = WideCharToMultiByte(CP_UTF8, 0, wide, source_len, nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return {};
+    std::string utf8(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, source_len, utf8.data(), required, nullptr, nullptr);
+    return utf8;
+}
+
+FolderBrowseResult BrowseForFolder(std::string& selected_path, std::string& error) {
+    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool should_uninitialize = SUCCEEDED(init_hr) || init_hr == S_FALSE;
+    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
+        error = "Unable to initialize the folder picker.";
+        return FolderBrowseResult::Failed;
+    }
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        if (should_uninitialize) CoUninitialize();
+        error = "Unable to open the folder picker dialog.";
+        return FolderBrowseResult::Failed;
+    }
+
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Select Project Parent Location");
+
+    hr = dialog->Show(nullptr);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        return FolderBrowseResult::Cancelled;
+    }
+    if (FAILED(hr)) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "Folder picker dialog failed.";
+        return FolderBrowseResult::Failed;
+    }
+
+    IShellItem* item = nullptr;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "Could not read selected folder.";
+        return FolderBrowseResult::Failed;
+    }
+
+    PWSTR raw_path = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw_path);
+    if (FAILED(hr) || !raw_path) {
+        item->Release();
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "Could not resolve selected folder path.";
+        return FolderBrowseResult::Failed;
+    }
+
+    selected_path = WideToUtf8(raw_path);
+
+    CoTaskMemFree(raw_path);
+    item->Release();
+    dialog->Release();
+    if (should_uninitialize) CoUninitialize();
+
+    if (selected_path.empty()) {
+        error = "Selected folder path is empty.";
+        return FolderBrowseResult::Failed;
+    }
+    return FolderBrowseResult::Selected;
+}
+
+FolderBrowseResult BrowseForProjectManifest(std::string& selected_path, std::string& error) {
+    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool should_uninitialize = SUCCEEDED(init_hr) || init_hr == S_FALSE;
+    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
+        error = "Unable to initialize the file picker.";
+        return FolderBrowseResult::Failed;
+    }
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        if (should_uninitialize) CoUninitialize();
+        error = "Unable to open the file picker dialog.";
+        return FolderBrowseResult::Failed;
+    }
+
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Assurance Forge Project (af.proj)", L"af.proj"},
+        {L"Project Files (*.proj)", L"*.proj"},
+        {L"All Files (*.*)", L"*.*"},
+    };
+    dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
+    dialog->SetFileTypeIndex(1);
+    dialog->SetDefaultExtension(L"proj");
+    dialog->SetTitle(L"Select Project Manifest (af.proj)");
+
+    hr = dialog->Show(nullptr);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        return FolderBrowseResult::Cancelled;
+    }
+    if (FAILED(hr)) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "File picker dialog failed.";
+        return FolderBrowseResult::Failed;
+    }
+
+    IShellItem* item = nullptr;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "Could not read selected project file.";
+        return FolderBrowseResult::Failed;
+    }
+
+    PWSTR raw_path = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw_path);
+    if (FAILED(hr) || !raw_path) {
+        item->Release();
+        dialog->Release();
+        if (should_uninitialize) CoUninitialize();
+        error = "Could not resolve selected project path.";
+        return FolderBrowseResult::Failed;
+    }
+
+    selected_path = WideToUtf8(raw_path);
+
+    CoTaskMemFree(raw_path);
+    item->Release();
+    dialog->Release();
+    if (should_uninitialize) CoUninitialize();
+
+    if (selected_path.empty()) {
+        error = "Selected project path is empty.";
+        return FolderBrowseResult::Failed;
+    }
+    return FolderBrowseResult::Selected;
+}
+#endif
 
 }  // namespace
-
-// Pointer to the currently constructed AppRuntime, used by free functions
-// (RequestAddChild / RequestNotImplemented) so UI code can poke the runtime
-// without a circular include or callback plumbing.
-static AppRuntime* g_active_runtime = nullptr;
 
 struct AppRuntime::Impl {
     core::AppState app_state;
@@ -150,10 +265,21 @@ struct AppRuntime::Impl {
 
     float left_ratio = kInitialLeftPanelRatio;
     float right_ratio = kInitialRightPanelRatio;
+    float project_boundary_ratio = kInitialProjectBoundaryRatio;
 
     // Modal for unimplemented features
     bool show_not_implemented_modal = false;
     std::string not_implemented_feature;
+    bool show_startup_project_window = true;
+
+    bool show_create_project_modal = false;
+    bool show_open_project_modal = false;
+    bool show_project_file_name_modal = false;
+    ProjectFileCreateKind pending_project_file_kind = ProjectFileCreateKind::Sacm;
+    char project_name_buf[128] = "MySafetyCase";
+    char project_parent_buf[kPathBufferSize] = ".";
+    char project_file_name_buf[256] = "main.sacm";
+    bool show_save_before_exit_modal = false;
 
     // Modal for confirming a multi-element removal. Populated by RemoveSelected
     // when the planned removal targets more than one element.
@@ -194,39 +320,29 @@ void NormalizeCenterViewSelection(bool& show_gsn_tab,
     }
 }
 
-AppRuntime::AppRuntime() : impl_(new Impl()) {
-    g_active_runtime = this;
-    ScanDirectory();
+ui::ElementContextActions MakeElementContextActions(AppRuntime& runtime) {
+    return ui::ElementContextActions{
+        [&runtime](core::NewElementKind kind) { runtime.AddChildToSelected(kind); },
+        [&runtime]() { runtime.AddTopGoal(); },
+        [&runtime](core::RemoveMode mode) { runtime.RemoveSelected(mode); },
+        [&runtime](const char* feature) {
+            if (feature) runtime.ShowNotImplementedModal(feature);
+        },
+    };
+}
 
-    if (impl_->app_state.load_file(impl_->file_path_buf)) {
-        impl_->tree_needs_rebuild = true;
-        impl_->pending_focus_root = true;
-        ui::GetUiState().center_view = ui::CenterView::GsnCanvas;
-    }
+AppRuntime::AppRuntime() : impl_(new Impl()) {
+    impl_->current_tree = core::AssuranceTree();
+    ui::gsn::SetCanvasTree(impl_->current_tree);
+    ui::RebuildRegisterViews(nullptr);
+
+    ui::UiState& ui_state = ui::GetUiState();
+    ui_state.center_view = ui::CenterView::GsnCanvas;
+    ui_state.selected_element_id.clear();
 }
 
 AppRuntime::~AppRuntime() {
-    if (g_active_runtime == this) g_active_runtime = nullptr;
     delete impl_;
-}
-
-void RequestAddChild(core::NewElementKind kind) {
-    if (g_active_runtime) g_active_runtime->AddChildToSelected(kind);
-}
-
-void RequestRemove(core::RemoveMode mode) {
-    if (g_active_runtime) g_active_runtime->RemoveSelected(mode);
-}
-
-const parser::AssuranceCase* GetActiveAssuranceCase() {
-    if (!g_active_runtime) return nullptr;
-    return g_active_runtime->GetLoadedCase();
-}
-
-void RequestNotImplemented(const char* feature) {
-    if (g_active_runtime && feature) {
-        g_active_runtime->ShowNotImplementedModal(feature);
-    }
 }
 
 bool AppRuntime::AddChildToSelected(core::NewElementKind kind) {
@@ -256,6 +372,34 @@ bool AppRuntime::AddChildToSelected(core::NewElementKind kind) {
     ui::UiState& s = ui::GetUiState();
     s.selected_element_id = new_id;
     s.center_on_selection = true;
+    impl_->app_state.mark_dirty();
+    SetStatus("Added " + new_id);
+    return true;
+}
+
+bool AppRuntime::AddTopGoal() {
+    if (!impl_->app_state.loaded_case.has_value()) {
+        SetStatus("No assurance case loaded.");
+        return false;
+    }
+
+    parser::AssuranceCase& ac = impl_->app_state.loaded_case.value();
+    sacm::AssuranceCasePackage* pkg = impl_->app_state.sacm_package.has_value()
+                                          ? &impl_->app_state.sacm_package.value()
+                                          : nullptr;
+
+    std::string new_id;
+    std::string error;
+    if (!core::AddTopGoal(ac, pkg, new_id, error)) {
+        SetStatus("Add failed: " + error);
+        return false;
+    }
+
+    impl_->tree_needs_rebuild = true;
+    ui::UiState& s = ui::GetUiState();
+    s.selected_element_id = new_id;
+    s.center_on_selection = true;
+    impl_->app_state.mark_dirty();
     SetStatus("Added " + new_id);
     return true;
 }
@@ -291,6 +435,7 @@ void AppRuntime::RemoveSelected(core::RemoveMode mode) {
         }
         impl_->tree_needs_rebuild = true;
         ui::GetUiState().selected_element_id.clear();
+        impl_->app_state.mark_dirty();
         SetStatus("Removed " + selected_id);
         return;
     }
@@ -370,8 +515,8 @@ void AppRuntime::RebuildDerivedViewsIfNeeded() {
     }
 
     const auto& ac = impl_->app_state.loaded_case.value();
-    impl_->current_tree = ui::BuildAssuranceTree(ac);
-    ui::SetCanvasTree(impl_->current_tree);
+    impl_->current_tree = ui::gsn::BuildAssuranceTree(ac);
+    ui::gsn::SetCanvasTree(impl_->current_tree);
     ui::RebuildRegisterViews(&ac);
     ui::GetUiState().model_has_translations = ui::ModelHasTranslations(ac);
 
@@ -393,9 +538,39 @@ float AppRuntime::RenderMainMenuBar(bool& done) {
     }
 
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Exit")) {
-            done = true;
+        if (ImGui::MenuItem("Create Empty Assurance Project")) {
+            BeginCreateProject();
         }
+        if (ImGui::MenuItem("Open Project")) {
+            BeginOpenProject();
+        }
+        ImGui::Separator();
+        bool has_project = impl_->app_state.current_project.has_value();
+        if (!has_project) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Save Project")) {
+            SaveProject();
+        }
+        if (!has_project) ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Exit")) {
+            RequestExit(done);
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Add")) {
+        bool has_project = impl_->app_state.current_project.has_value();
+        if (!has_project) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("New GSN / SACM File")) {
+            BeginCreateProjectSacmFile();
+        }
+        if (ImGui::MenuItem("New Evidence Register")) {
+            BeginCreateProjectEvidenceRegister();
+        }
+        if (ImGui::MenuItem("New J3377 CAE Register")) {
+            BeginCreateProjectJ3377CaeRegister();
+        }
+        if (!has_project) ImGui::EndDisabled();
         ImGui::EndMenu();
     }
 
@@ -411,6 +586,11 @@ float AppRuntime::RenderMainMenuBar(bool& done) {
             impl_->force_center_tab_selection,
             ui_state.center_view);
 
+        ImGui::Separator();
+        if (ImGui::MenuItem("Welcome Screen")) {
+            impl_->show_startup_project_window = true;
+        }
+
         ImGui::EndMenu();
     }
 
@@ -419,160 +599,91 @@ float AppRuntime::RenderMainMenuBar(bool& done) {
 }
 
 void AppRuntime::RenderSplitters(float display_w, float content_h, float left_w, float center_w, float top_y) {
-    DrawVerticalSplitter("##left_splitter", left_w, kSplitterThickness, content_h, top_y, display_w, impl_->left_ratio, false);
+    ui::widgets::DrawVerticalSplitter("##left_splitter",
+                             left_w,
+                             kSplitterThickness,
+                             content_h,
+                             top_y,
+                             display_w,
+                             impl_->left_ratio,
+                             false,
+                             kMinPanelRatio,
+                             kMaxPanelRatio,
+                             kPanelFlags);
 
     float center_x = left_w + kSplitterThickness;
-    DrawVerticalSplitter("##right_splitter", center_x + center_w, kSplitterThickness, content_h, top_y, display_w, impl_->right_ratio, true);
+    ui::widgets::DrawVerticalSplitter("##right_splitter",
+                             center_x + center_w,
+                             kSplitterThickness,
+                             content_h,
+                             top_y,
+                             display_w,
+                             impl_->right_ratio,
+                             true,
+                             kMinPanelRatio,
+                             kMaxPanelRatio,
+                             kPanelFlags);
+
+    float available_h = content_h - kSplitterThickness;
+    if (available_h <= 0.0f) return;
+
+    float min_ratio = kMinLeftSectionHeight / available_h;
+    if (min_ratio > 0.30f) min_ratio = 0.30f;
+
+    auto clamp_boundaries = [&]() {
+        if (impl_->project_boundary_ratio < min_ratio) impl_->project_boundary_ratio = min_ratio;
+        if (impl_->project_boundary_ratio > 1.0f - min_ratio) impl_->project_boundary_ratio = 1.0f - min_ratio;
+    };
+
+    clamp_boundaries();
+
+    float splitter1_y = top_y + available_h * impl_->project_boundary_ratio;
+
+    float delta1 = ui::widgets::DrawHorizontalSplitter("##left_h_splitter_1", 0.0f, splitter1_y, left_w, kSplitterThickness, kPanelFlags);
+    if (delta1 != 0.0f) {
+        impl_->project_boundary_ratio += delta1 / available_h;
+        clamp_boundaries();
+    }
 }
 
-void AppRuntime::RenderTreePanel(float left_w, float top_left_h, float top_y) {
+void AppRuntime::RenderTreePanel(float left_w, float safety_tree_h, float top_y) {
     ImGui::SetNextWindowPos(ImVec2(0, top_y));
-    ImGui::SetNextWindowSize(ImVec2(left_w, top_left_h));
+    ImGui::SetNextWindowSize(ImVec2(left_w, safety_tree_h));
     ImGui::Begin("Safety Case Tree", nullptr, kPanelFlags);
-    ui::ShowTreeViewPanel(impl_->current_tree.root ? &impl_->current_tree : nullptr);
+    ui::UiState& ui_state = ui::GetUiState();
+    ui::ElementContextActions actions = MakeElementContextActions(*this);
+    ui::ShowTreeViewPanel(impl_->current_tree.root ? &impl_->current_tree : nullptr,
+                          GetLoadedCase(),
+                          ui_state,
+                          actions);
     ImGui::End();
 }
 
-void AppRuntime::RenderSacmViewerPanel(float left_w, float top_left_h, float bottom_left_h, float top_y) {
-    ImGui::SetNextWindowPos(ImVec2(0, top_y + top_left_h));
-    ImGui::SetNextWindowSize(ImVec2(left_w, bottom_left_h));
-    ImGui::Begin("SACM Viewer", nullptr, kPanelFlags);
-
-    ImGui::Text("Directory:");
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputText("##dirpath", impl_->dir_path_buf, sizeof(impl_->dir_path_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
-        ScanDirectory();
-    }
-
-    ImGui::Text("XML File:");
-    ImGui::SetNextItemWidth(-1);
-    if (impl_->xml_files.empty()) {
-        ImGui::TextDisabled("No XML files found");
-    } else {
-        const char* preview = "";
-        if (impl_->selected_file_idx >= 0 && impl_->selected_file_idx < static_cast<int>(impl_->xml_files.size())) {
-            const std::string& sel = impl_->xml_files[impl_->selected_file_idx];
-            auto pos = sel.find_last_of("\\/");
-            preview = (pos != std::string::npos) ? sel.c_str() + pos + 1 : sel.c_str();
-        }
-
-        if (ImGui::BeginCombo("##fileselect", preview)) {
-            for (int i = 0; i < static_cast<int>(impl_->xml_files.size()); ++i) {
-                const std::string& path = impl_->xml_files[i];
-                auto pos = path.find_last_of("\\/");
-                const char* label = (pos != std::string::npos) ? path.c_str() + pos + 1 : path.c_str();
-                bool is_selected = (i == impl_->selected_file_idx);
-
-                if (ImGui::Selectable(label, is_selected)) {
-                    impl_->selected_file_idx = i;
-                    size_t len = path.size();
-                    if (len >= sizeof(impl_->file_path_buf)) len = sizeof(impl_->file_path_buf) - 1;
-                    memcpy(impl_->file_path_buf, path.c_str(), len);
-                    impl_->file_path_buf[len] = '\0';
-                }
-                if (is_selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-    }
-
-    if (ImGui::Button("Load")) {
-        if (impl_->app_state.load_file(impl_->file_path_buf)) {
+void AppRuntime::RenderSacmViewerPanel(float left_w, float sacm_h, float top_y) {
+    ui::panels::SacmViewerPanelModel model{
+        impl_->app_state,
+        impl_->dir_path_buf,
+        sizeof(impl_->dir_path_buf),
+        impl_->file_path_buf,
+        sizeof(impl_->file_path_buf),
+        impl_->xml_files,
+        impl_->selected_file_idx,
+        impl_->show_overwrite_confirm,
+    };
+    ui::panels::SacmViewerPanelCallbacks callbacks{
+        [this]() { ScanDirectory(); },
+        [this]() {
             impl_->tree_needs_rebuild = true;
             impl_->pending_focus_root = true;
-        } else {
+        },
+        [this]() {
             impl_->current_tree = core::AssuranceTree();
-            ui::SetCanvasTree(impl_->current_tree);
+            ui::gsn::SetCanvasTree(impl_->current_tree);
             ui::RebuildRegisterViews(nullptr);
             ui::GetUiState().selected_element_id.clear();
-        }
-    }
-
-    ImGui::SameLine();
-    {
-        bool can_save = impl_->app_state.sacm_package.has_value();
-        if (!can_save) ImGui::BeginDisabled();
-        if (ImGui::Button("Save")) {
-            FILE* f = fopen(impl_->file_path_buf, "r");
-            if (f) {
-                fclose(f);
-                impl_->show_overwrite_confirm = true;
-            } else {
-                impl_->app_state.save_file(impl_->file_path_buf);
-            }
-        }
-        if (!can_save) ImGui::EndDisabled();
-    }
-
-    if (impl_->show_overwrite_confirm) {
-        ImGui::OpenPopup("Overwrite File?");
-        impl_->show_overwrite_confirm = false;
-    }
-
-    if (ImGui::BeginPopupModal("Overwrite File?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("File already exists:\n%s", impl_->file_path_buf);
-        ImGui::Separator();
-        ImGui::Text("Are you sure you want to overwrite it?");
-        ImGui::Spacing();
-
-        if (ImGui::Button("Yes, Overwrite", ImVec2(kOverwriteButtonWidth, 0))) {
-            impl_->app_state.save_file(impl_->file_path_buf);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(kOverwriteButtonWidth, 0))) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-
-    if (!impl_->app_state.status_message.empty()) {
-        ImGui::TextWrapped("%s", impl_->app_state.status_message.c_str());
-    }
-
-    ImGui::Separator();
-
-    if (impl_->app_state.loaded_case.has_value()) {
-        const auto& ac = impl_->app_state.loaded_case.value();
-
-        if (ImGui::BeginChild("ProjectSummary", ImVec2(0, kSummaryStripHeight), true, ImGuiWindowFlags_NoScrollbar)) {
-            ImGui::Text("Project Summary");
-            if (ImGui::BeginTable("ProjectSummaryMetrics", 5, ImGuiTableFlags_SizingStretchSame)) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); SummaryMetric("Claims", CountElementsOfType(ac, "claim"));
-                ImGui::TableNextColumn(); SummaryMetric("Strategies", CountElementsOfType(ac, "argumentreasoning"));
-                ImGui::TableNextColumn(); SummaryMetric("Evidence", CountElementsOfType(ac, "artifact", "artifactreference") + CountElementsOfType(ac, "expression"));
-                ImGui::TableNextColumn(); SummaryMetric("CSE Rows", static_cast<int>(ui::GetCseRegisterRowCount()));
-                ImGui::TableNextColumn(); SummaryMetric("Evidence Rows", static_cast<int>(ui::GetEvidenceRegisterRowCount()));
-                ImGui::EndTable();
-            }
-        }
-        ImGui::EndChild();
-
-        ImGui::Text("Assurance Case: %s", ac.name.c_str());
-        ImGui::Separator();
-
-        if (ImGui::BeginChild("ElementList", ImVec2(0, 0), true)) {
-            for (const auto& elem : ac.elements) {
-                ImGui::PushID(elem.id.c_str());
-
-                ImVec4 color = ElementTypeColor(elem.type.c_str());
-
-                ImGui::TextColored(color, "[%s]", elem.type.c_str());
-                ImGui::SameLine();
-                ImGui::Text("%s: %s", elem.id.c_str(), elem.name.c_str());
-
-                if (!elem.content.empty()) {
-                    ImGui::TextWrapped("  Content: %s", elem.content.c_str());
-                }
-
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndChild();
-    }
-
-    ImGui::End();
+        },
+    };
+    ui::panels::ShowSacmViewerPanel(left_w, sacm_h, top_y, kPanelFlags, model, callbacks);
 }
 
 void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content_h, float top_y) {
@@ -595,7 +706,8 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
                                           : 0;
             if (ImGui::BeginTabItem("GSN Canvas", nullptr, gsn_flags)) {
                 ui_state.center_view = ui::CenterView::GsnCanvas;
-                ui::ShowGsnCanvasContent();
+                ui::ElementContextActions actions = MakeElementContextActions(*this);
+                ui::gsn::ShowGsnCanvasContent(ui_state, GetLoadedCase(), actions);
                 ImGui::EndTabItem();
             }
         }
@@ -606,6 +718,12 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
                                           : 0;
             if (ImGui::BeginTabItem("CSE Register", nullptr, cse_flags)) {
                 ui_state.center_view = ui::CenterView::CseRegister;
+                if (impl_->app_state.active_project_file_role == core::ProjectFileRole::J3377CaeRegister) {
+                    ImGui::TextWrapped("J3377 CAE register file: %s",
+                                       impl_->app_state.active_project_file_path.string().c_str());
+                    ImGui::TextDisabled("Editable CAE register content will be implemented in a later workflow.");
+                    ImGui::Separator();
+                }
                 ui::ShowCseRegisterView();
                 ImGui::EndTabItem();
             }
@@ -617,6 +735,12 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
                                                : 0;
             if (ImGui::BeginTabItem("Evidence Register", nullptr, evidence_flags)) {
                 ui_state.center_view = ui::CenterView::EvidenceRegister;
+                if (impl_->app_state.active_project_file_role == core::ProjectFileRole::EvidenceRegister) {
+                    ImGui::TextWrapped("Evidence register file: %s",
+                                       impl_->app_state.active_project_file_path.string().c_str());
+                    ImGui::TextDisabled("Editable evidence register content will be implemented in a later workflow.");
+                    ImGui::Separator();
+                }
                 ui::ShowEvidenceRegisterView();
                 ImGui::EndTabItem();
             }
@@ -637,8 +761,9 @@ void AppRuntime::RenderElementPropertiesPanel(float center_x, float center_w, fl
 
     parser::AssuranceCase* ac_ptr = impl_->app_state.loaded_case.has_value() ? &impl_->app_state.loaded_case.value() : nullptr;
     sacm::AssuranceCasePackage* sacm_ptr = impl_->app_state.sacm_package.has_value() ? &impl_->app_state.sacm_package.value() : nullptr;
-    if (ui::ShowElementPanel(ac_ptr, sacm_ptr)) {
+    if (ui::panels::ShowElementPanel(ac_ptr, sacm_ptr)) {
         impl_->tree_needs_rebuild = true;
+        impl_->app_state.mark_dirty();
     }
 
     ImGui::End();
@@ -713,6 +838,7 @@ void AppRuntime::RenderRemoveConfirmModal() {
                 } else {
                     impl_->tree_needs_rebuild = true;
                     ui::GetUiState().selected_element_id.clear();
+                    impl_->app_state.mark_dirty();
                     SetStatus("Removed " + std::to_string(n) + " element" + (n == 1 ? "" : "s"));
                 }
             }
@@ -728,12 +854,338 @@ void AppRuntime::RenderRemoveConfirmModal() {
     }
 }
 
+void AppRuntime::RenderStartupProjectWindow() {
+    // TODO: Populate from persisted recent-projects list. Placeholder data shown for now.
+    static const std::vector<ui::panels::RecentProjectEntry> kDemoRecent = {
+        { "Open Autonomy Safety Case", "data/oasc-ja.xml", 42, 9, 16, 3 },
+    };
+    ui::panels::WelcomeModalCallbacks callbacks{
+        [this]() { BeginCreateProject(); },
+        [this]() { ShowNotImplementedModal("Create Assurance Project from Template"); },
+        [this]() { BeginOpenProject(); },
+        [this]() { ShowNotImplementedModal("Import SACM"); },
+        [this](const ui::panels::RecentProjectEntry& /*entry*/) {
+            BeginOpenProject();
+        },
+    };
+    ui::panels::ShowWelcomeModal(impl_->show_startup_project_window, kDemoRecent, callbacks);
+}
+
+void AppRuntime::BeginCreateProject() {
+    impl_->show_create_project_modal = true;
+}
+
+void AppRuntime::BeginOpenProject() {
+    impl_->show_open_project_modal = true;
+}
+
+void AppRuntime::BeginCreateProjectSacmFile() {
+    if (!impl_->app_state.current_project.has_value()) {
+        SetStatus("Create or open a project first.");
+        return;
+    }
+    impl_->pending_project_file_kind = ProjectFileCreateKind::Sacm;
+    CopyToBuffer(impl_->project_file_name_buf, sizeof(impl_->project_file_name_buf), "main.sacm");
+    impl_->show_project_file_name_modal = true;
+}
+
+void AppRuntime::BeginCreateProjectEvidenceRegister() {
+    if (!impl_->app_state.current_project.has_value()) {
+        SetStatus("Create or open a project first.");
+        return;
+    }
+    impl_->pending_project_file_kind = ProjectFileCreateKind::EvidenceRegister;
+    CopyToBuffer(impl_->project_file_name_buf, sizeof(impl_->project_file_name_buf), "evidence-register.af.json");
+    impl_->show_project_file_name_modal = true;
+}
+
+void AppRuntime::BeginCreateProjectJ3377CaeRegister() {
+    if (!impl_->app_state.current_project.has_value()) {
+        SetStatus("Create or open a project first.");
+        return;
+    }
+    impl_->pending_project_file_kind = ProjectFileCreateKind::J3377CaeRegister;
+    CopyToBuffer(impl_->project_file_name_buf, sizeof(impl_->project_file_name_buf), "j3377-cae-register.af.json");
+    impl_->show_project_file_name_modal = true;
+}
+
+void AppRuntime::OpenProjectFile(const core::ProjectFileEntry& entry) {
+    if (!impl_->app_state.open_project_file(entry)) return;
+
+    ui::UiState& ui_state = ui::GetUiState();
+    if (entry.role == core::ProjectFileRole::SacmArgument) {
+        impl_->tree_needs_rebuild = true;
+        impl_->pending_focus_root = true;
+        impl_->show_gsn_tab = true;
+        ui_state.center_view = ui::CenterView::GsnCanvas;
+        impl_->force_center_tab_selection = true;
+    } else if (entry.role == core::ProjectFileRole::EvidenceRegister) {
+        impl_->show_evidence_tab = true;
+        ui_state.center_view = ui::CenterView::EvidenceRegister;
+        impl_->force_center_tab_selection = true;
+    } else if (entry.role == core::ProjectFileRole::J3377CaeRegister) {
+        impl_->show_cse_tab = true;
+        ui_state.center_view = ui::CenterView::CseRegister;
+        impl_->force_center_tab_selection = true;
+    }
+}
+
+bool AppRuntime::OpenFirstProjectSacmFile() {
+    if (!impl_->app_state.current_project.has_value()) return false;
+
+    for (const auto& entry : impl_->app_state.current_project->files) {
+        if (entry.role != core::ProjectFileRole::SacmArgument) continue;
+        if (entry.state == core::ProjectFileState::Missing) continue;
+        if (impl_->app_state.open_project_file(entry)) {
+            impl_->tree_needs_rebuild = true;
+            impl_->pending_focus_root = true;
+            impl_->show_gsn_tab = true;
+            ui::UiState& ui_state = ui::GetUiState();
+            ui_state.center_view = ui::CenterView::GsnCanvas;
+            impl_->force_center_tab_selection = true;
+            return true;
+        }
+    }
+
+    SetStatus("Project opened, but no SACM file could be loaded.");
+    return false;
+}
+
+void AppRuntime::RenderCreateProjectModal() {
+    if (!impl_->show_create_project_modal) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Create Empty Assurance Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const ui::Theme& theme = ui::GetTheme();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ColorFromU32(theme.surface_3));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ColorFromU32(ui::WithAlpha(theme.surface_3, 0.90f)));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ColorFromU32(ui::WithAlpha(theme.accent, 0.28f)));
+        ImGui::PushStyleColor(ImGuiCol_Border, ColorFromU32(theme.border_strong));
+
+        ImGui::TextUnformatted("Project name");
+        ImGui::SetNextItemWidth(420.0f);
+        ImGui::InputText("##project_name", impl_->project_name_buf, sizeof(impl_->project_name_buf));
+
+        ImGui::TextUnformatted("Parent location");
+        ImGui::SetNextItemWidth(330.0f);
+        ImGui::InputText("##project_parent", impl_->project_parent_buf, sizeof(impl_->project_parent_buf));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...", ImVec2(84.0f, 0.0f))) {
+#ifdef _WIN32
+            std::string selected_path;
+            std::string error;
+            FolderBrowseResult result = BrowseForFolder(selected_path, error);
+            if (result == FolderBrowseResult::Selected) {
+                CopyToBuffer(impl_->project_parent_buf, sizeof(impl_->project_parent_buf), selected_path);
+            } else if (result == FolderBrowseResult::Failed) {
+                SetStatus(error);
+            }
+#else
+            SetStatus("Folder browsing is only available on Windows in this build.");
+#endif
+        }
+
+        ImGui::PopStyleColor(4);
+        ImGui::Spacing();
+
+        if (ImGui::Button("Create", ImVec2(110.0f, 0.0f))) {
+            if (impl_->app_state.create_empty_project(impl_->project_name_buf, impl_->project_parent_buf)) {
+                OpenFirstProjectSacmFile();
+                impl_->show_create_project_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+            impl_->show_create_project_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (impl_->show_create_project_modal) {
+        ImGui::OpenPopup("Create Empty Assurance Project");
+    }
+}
+
+void AppRuntime::RenderOpenProjectModal() {
+    if (!impl_->show_open_project_modal) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Open Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Select an af.proj file to open");
+        if (ImGui::Button("Browse...", ImVec2(120.0f, 0.0f))) {
+#ifdef _WIN32
+            std::string selected_path;
+            std::string error;
+            FolderBrowseResult result = BrowseForProjectManifest(selected_path, error);
+            if (result == FolderBrowseResult::Selected) {
+                std::filesystem::path manifest_path(selected_path);
+                std::string file_name = manifest_path.filename().string();
+                std::transform(file_name.begin(), file_name.end(), file_name.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (file_name != "af.proj") {
+                    SetStatus("Please select an af.proj file.");
+                } else if (impl_->app_state.open_project(selected_path)) {
+                    OpenFirstProjectSacmFile();
+                    impl_->show_open_project_modal = false;
+                    ImGui::CloseCurrentPopup();
+                }
+            } else if (result == FolderBrowseResult::Failed) {
+                SetStatus(error);
+            }
+#else
+            SetStatus("Project browsing is only available on Windows in this build.");
+#endif
+        }
+        ImGui::Spacing();
+
+        if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+            impl_->show_open_project_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (impl_->show_open_project_modal) {
+        ImGui::OpenPopup("Open Project");
+    }
+}
+
+void AppRuntime::RenderProjectFileNameModal() {
+    if (!impl_->show_project_file_name_modal) return;
+
+    const char* title = ProjectFileCreateTitle(impl_->pending_project_file_kind);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const ui::Theme& theme = ui::GetTheme();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ColorFromU32(theme.surface_3));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ColorFromU32(ui::WithAlpha(theme.surface_3, 0.90f)));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ColorFromU32(ui::WithAlpha(theme.accent, 0.28f)));
+        ImGui::PushStyleColor(ImGuiCol_Border, ColorFromU32(theme.border_strong));
+
+        ImGui::TextUnformatted("File name");
+        ImGui::SetNextItemWidth(420.0f);
+        ImGui::InputText("##project_file_name", impl_->project_file_name_buf, sizeof(impl_->project_file_name_buf));
+        ImGui::PopStyleColor(4);
+        ImGui::Spacing();
+
+        if (ImGui::Button("Create", ImVec2(110.0f, 0.0f))) {
+            bool created = false;
+            if (impl_->pending_project_file_kind == ProjectFileCreateKind::Sacm) {
+                created = impl_->app_state.create_project_sacm_file(impl_->project_file_name_buf);
+            } else if (impl_->pending_project_file_kind == ProjectFileCreateKind::EvidenceRegister) {
+                created = impl_->app_state.create_project_evidence_register(impl_->project_file_name_buf);
+            } else {
+                created = impl_->app_state.create_project_j3377_cae_register(impl_->project_file_name_buf);
+            }
+            if (created) {
+                impl_->show_project_file_name_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+            impl_->show_project_file_name_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (impl_->show_project_file_name_modal) {
+        ImGui::OpenPopup(title);
+    }
+}
+
+void AppRuntime::RenderProjectLoadReportModal() {
+    auto& report = impl_->app_state.last_project_load_report;
+    if (!report.showPopup) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Project Loading Status", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        for (const auto& step : report.steps) {
+            const char* mark = "[OK]";
+            if (step.status == core::ProjectLoadStepStatus::Failed) mark = "[FAIL]";
+            if (step.status == core::ProjectLoadStepStatus::Warning) mark = "[WARN]";
+            ImGui::Text("%s %s", mark, step.label.c_str());
+            if (!step.message.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", step.message.c_str());
+            }
+        }
+        if (!report.warnings.empty()) {
+            ImGui::Separator();
+            ImGui::TextUnformatted("External changes detected");
+            for (const auto& warning : report.warnings) {
+                ImGui::BulletText("%s", warning.c_str());
+            }
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("OK", ImVec2(100.0f, 0.0f))) {
+            report.showPopup = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (report.showPopup) {
+        ImGui::OpenPopup("Project Loading Status");
+    }
+}
+
+void AppRuntime::RenderSaveBeforeExitModal(bool& done) {
+    if (!impl_->show_save_before_exit_modal) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("You have unsaved changes. Save before closing?");
+        ImGui::Spacing();
+
+        if (ImGui::Button("Save", ImVec2(100.0f, 0.0f))) {
+            bool saved = false;
+            if (impl_->app_state.current_project.has_value()) {
+                saved = SaveProject();
+            } else {
+                saved = impl_->app_state.save_current_document();
+            }
+
+            if (saved) {
+                impl_->show_save_before_exit_modal = false;
+                done = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(100.0f, 0.0f))) {
+            impl_->show_save_before_exit_modal = false;
+            done = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
+            impl_->show_save_before_exit_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (impl_->show_save_before_exit_modal) {
+        ImGui::OpenPopup("Unsaved Changes");
+    }
+}
+
+bool AppRuntime::SaveProject() {
+    return impl_->app_state.save_project();
+}
+
+void AppRuntime::RequestExit(bool& done) {
+    if (impl_->app_state.has_unsaved_changes) {
+        impl_->show_save_before_exit_modal = true;
+        return;
+    }
+    done = true;
+}
+
 const parser::AssuranceCase* AppRuntime::GetLoadedCase() const {
     if (!impl_->app_state.loaded_case.has_value()) return nullptr;
     return &impl_->app_state.loaded_case.value();
 }
 
 void AppRuntime::RenderFrame(bool& done) {
+    if (app::platform::ConsumeCloseRequest()) {
+        RequestExit(done);
+    }
+
     ImVec2 display = ImGui::GetIO().DisplaySize;
     float top_y = RenderMainMenuBar(done);
 
@@ -743,15 +1195,32 @@ void AppRuntime::RenderFrame(bool& done) {
     float right_w = display.x * impl_->right_ratio;
     float center_w = display.x - left_w - right_w - kSplitterThickness * 2.0f;
 
-    float top_left_h = content_h * kTopLeftHeightRatio;
-    float bottom_left_h = content_h - top_left_h;
-
     RebuildDerivedViewsIfNeeded();
 
     RenderSplitters(display.x, content_h, left_w, center_w, top_y);
 
-    RenderTreePanel(left_w, top_left_h, top_y);
-    RenderSacmViewerPanel(left_w, top_left_h, bottom_left_h, top_y);
+    left_w = display.x * impl_->left_ratio;
+    right_w = display.x * impl_->right_ratio;
+    center_w = display.x - left_w - right_w - kSplitterThickness * 2.0f;
+
+    float available_h = std::max(0.0f, content_h - kSplitterThickness);
+    float project_h = available_h * impl_->project_boundary_ratio;
+    float safety_tree_h = std::max(0.0f, available_h - project_h);
+
+    float project_y = top_y;
+    float safety_y = project_y + project_h + kSplitterThickness;
+
+    ui::panels::ProjectFilesPanelModel project_model{
+        impl_->app_state.current_project.has_value() ? &impl_->app_state.current_project.value() : nullptr,
+    };
+    ui::panels::ProjectFilesPanelCallbacks project_callbacks{
+        [this]() { BeginCreateProjectSacmFile(); },
+        [this]() { BeginCreateProjectEvidenceRegister(); },
+        [this]() { BeginCreateProjectJ3377CaeRegister(); },
+        [this](const core::ProjectFileEntry& entry) { OpenProjectFile(entry); },
+    };
+    ui::panels::ShowProjectFilesPanel(left_w, project_h, project_y, kPanelFlags, project_model, project_callbacks);
+    RenderTreePanel(left_w, safety_tree_h, safety_y);
 
     float center_x = left_w + kSplitterThickness;
     RenderCenterPanel(center_x, center_w, content_h, top_y);
@@ -759,6 +1228,12 @@ void AppRuntime::RenderFrame(bool& done) {
 
     RenderNotImplementedModal();
     RenderRemoveConfirmModal();
+    RenderCreateProjectModal();
+    RenderOpenProjectModal();
+    RenderProjectFileNameModal();
+    RenderProjectLoadReportModal();
+    RenderSaveBeforeExitModal(done);
+    RenderStartupProjectWindow();
 }
 
 }  // namespace app
