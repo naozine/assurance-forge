@@ -46,6 +46,7 @@ jobs:
 
       - name: Generate coverage report (full src/)
         run: |
+          mkdir -p coverage_full
           gcovr -r . build-coverage \
             --filter 'src/' \
             --exclude 'external/' \
@@ -59,6 +60,7 @@ jobs:
 
       - name: Generate coverage report (core scope)
         run: |
+          mkdir -p coverage_core
           gcovr -r . build-coverage \
             --filter 'src/' \
             --exclude 'src/app/' \
