@@ -1,5 +1,16 @@
 #include "app/app_runtime.h"
-#include "app/platform_win32_dx11.h"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+#include "app/native_file_dialogs.h"
 
 #include "ai/ai_claim_review.h"
 #include "ai/ai_service.h"
@@ -30,23 +41,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
-#include <cwchar>
 #include <filesystem>
-#include <iterator>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shobjidl.h>
-#endif
 
 namespace app {
 namespace {
@@ -93,6 +92,12 @@ const char* ProjectFileCreateTitle(ProjectFileCreateKind kind) {
 
 ImVec4 ColorFromU32(ImU32 color) {
     return ImGui::ColorConvertU32ToFloat4(color);
+}
+
+std::string LowercaseAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
 }
 
 core::ProblemItem MakeAiReviewProblem(const std::string& id,
@@ -145,167 +150,9 @@ std::filesystem::path FindGuidelinesFile() {
     return {};
 }
 
-#ifdef _WIN32
-enum class FolderBrowseResult {
-    Selected,
-    Cancelled,
-    Failed
-};
-
-std::string WideToUtf8(const wchar_t* wide) {
-    if (!wide) return {};
-    int source_len = static_cast<int>(std::wcslen(wide));
-    if (source_len <= 0) return {};
-    int required = WideCharToMultiByte(CP_UTF8, 0, wide, source_len, nullptr, 0, nullptr, nullptr);
-    if (required <= 0) return {};
-    std::string utf8(static_cast<size_t>(required), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide, source_len, utf8.data(), required, nullptr, nullptr);
-    return utf8;
+bool IsProjectManifestPath(const std::filesystem::path& path) {
+    return LowercaseAscii(path.filename().string()) == "af.proj";
 }
-
-FolderBrowseResult BrowseForFolder(std::string& selected_path, std::string& error) {
-    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    bool should_uninitialize = SUCCEEDED(init_hr) || init_hr == S_FALSE;
-    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
-        error = "Unable to initialize the folder picker.";
-        return FolderBrowseResult::Failed;
-    }
-
-    IFileOpenDialog* dialog = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) {
-        if (should_uninitialize) CoUninitialize();
-        error = "Unable to open the folder picker dialog.";
-        return FolderBrowseResult::Failed;
-    }
-
-    DWORD options = 0;
-    dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dialog->SetTitle(L"Select Project Parent Location");
-
-    hr = dialog->Show(nullptr);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        return FolderBrowseResult::Cancelled;
-    }
-    if (FAILED(hr)) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "Folder picker dialog failed.";
-        return FolderBrowseResult::Failed;
-    }
-
-    IShellItem* item = nullptr;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "Could not read selected folder.";
-        return FolderBrowseResult::Failed;
-    }
-
-    PWSTR raw_path = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw_path);
-    if (FAILED(hr) || !raw_path) {
-        item->Release();
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "Could not resolve selected folder path.";
-        return FolderBrowseResult::Failed;
-    }
-
-    selected_path = WideToUtf8(raw_path);
-
-    CoTaskMemFree(raw_path);
-    item->Release();
-    dialog->Release();
-    if (should_uninitialize) CoUninitialize();
-
-    if (selected_path.empty()) {
-        error = "Selected folder path is empty.";
-        return FolderBrowseResult::Failed;
-    }
-    return FolderBrowseResult::Selected;
-}
-
-FolderBrowseResult BrowseForProjectManifest(std::string& selected_path, std::string& error) {
-    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    bool should_uninitialize = SUCCEEDED(init_hr) || init_hr == S_FALSE;
-    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
-        error = "Unable to initialize the file picker.";
-        return FolderBrowseResult::Failed;
-    }
-
-    IFileOpenDialog* dialog = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) {
-        if (should_uninitialize) CoUninitialize();
-        error = "Unable to open the file picker dialog.";
-        return FolderBrowseResult::Failed;
-    }
-
-    DWORD options = 0;
-    dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
-
-    const COMDLG_FILTERSPEC filters[] = {
-        {L"Assurance Forge Project (af.proj)", L"af.proj"},
-        {L"Project Files (*.proj)", L"*.proj"},
-        {L"All Files (*.*)", L"*.*"},
-    };
-    dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
-    dialog->SetFileTypeIndex(1);
-    dialog->SetDefaultExtension(L"proj");
-    dialog->SetTitle(L"Select Project Manifest (af.proj)");
-
-    hr = dialog->Show(nullptr);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        return FolderBrowseResult::Cancelled;
-    }
-    if (FAILED(hr)) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "File picker dialog failed.";
-        return FolderBrowseResult::Failed;
-    }
-
-    IShellItem* item = nullptr;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "Could not read selected project file.";
-        return FolderBrowseResult::Failed;
-    }
-
-    PWSTR raw_path = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw_path);
-    if (FAILED(hr) || !raw_path) {
-        item->Release();
-        dialog->Release();
-        if (should_uninitialize) CoUninitialize();
-        error = "Could not resolve selected project path.";
-        return FolderBrowseResult::Failed;
-    }
-
-    selected_path = WideToUtf8(raw_path);
-
-    CoTaskMemFree(raw_path);
-    item->Release();
-    dialog->Release();
-    if (should_uninitialize) CoUninitialize();
-
-    if (selected_path.empty()) {
-        error = "Selected project path is empty.";
-        return FolderBrowseResult::Failed;
-    }
-    return FolderBrowseResult::Selected;
-}
-#endif
 
 }  // namespace
 
@@ -361,8 +208,10 @@ struct AppRuntime::Impl {
     ProjectFileCreateKind pending_project_file_kind = ProjectFileCreateKind::Sacm;
     char project_name_buf[128] = "MySafetyCase";
     char project_parent_buf[kPathBufferSize] = ".";
+    char open_project_path_buf[kPathBufferSize] = "";
     char project_file_name_buf[256] = "main.sacm";
     bool show_save_before_exit_modal = false;
+    bool close_requested = false;
 
     // Modal for confirming a multi-element removal. Populated by RemoveSelected
     // when the planned removal targets more than one element.
@@ -464,6 +313,10 @@ AppRuntime::AppRuntime() : impl_(new Impl()) {
 
 AppRuntime::~AppRuntime() {
     delete impl_;
+}
+
+void AppRuntime::RequestClose() {
+    impl_->close_requested = true;
 }
 
 bool AppRuntime::AddChildToSelected(core::NewElementKind kind) {
@@ -834,10 +687,12 @@ void AppRuntime::RenderSplitters(float display_w, float content_h, float left_w,
     float min_ratio = kMinLeftSectionHeight / available_h;
     if (min_ratio > 0.30f) min_ratio = 0.30f;
 
-    auto clamp_boundaries = [&]() {
-        if (impl_->project_boundary_ratio < min_ratio) impl_->project_boundary_ratio = min_ratio;
-        if (impl_->project_boundary_ratio > 1.0f - min_ratio) impl_->project_boundary_ratio = 1.0f - min_ratio;
-    };
+        auto clamp_boundaries = [&]() {
+            if (impl_->project_boundary_ratio < min_ratio) 
+                impl_->project_boundary_ratio = min_ratio;
+            if (impl_->project_boundary_ratio > 1.0f - min_ratio) 
+                impl_->project_boundary_ratio = 1.0f - min_ratio;
+        };
 
     clamp_boundaries();
 
@@ -1435,6 +1290,21 @@ bool AppRuntime::OpenFirstProjectSacmFile() {
     return false;
 }
 
+bool AppRuntime::TryOpenProjectManifest(const std::string& selected_path) {
+    std::filesystem::path manifest_path(selected_path);
+    if (!IsProjectManifestPath(manifest_path)) {
+        SetStatus("Please select an af.proj file.");
+        return false;
+    }
+    if (!impl_->app_state.open_project(selected_path)) {
+        return false;
+    }
+    OpenFirstProjectSacmFile();
+    impl_->show_open_project_modal = false;
+    ImGui::CloseCurrentPopup();
+    return true;
+}
+
 void AppRuntime::RenderCreateProjectModal() {
     if (!impl_->show_create_project_modal) return;
 
@@ -1455,18 +1325,15 @@ void AppRuntime::RenderCreateProjectModal() {
         ImGui::InputText("##project_parent", impl_->project_parent_buf, sizeof(impl_->project_parent_buf));
         ImGui::SameLine();
         if (ImGui::Button("Browse...", ImVec2(84.0f, 0.0f))) {
-#ifdef _WIN32
             std::string selected_path;
-            std::string error;
-            FolderBrowseResult result = BrowseForFolder(selected_path, error);
-            if (result == FolderBrowseResult::Selected) {
+            std::string error_message;
+            const dialogs::DialogResult result = dialogs::BrowseForProjectParentFolder(
+                impl_->project_parent_buf, selected_path, error_message);
+            if (result == dialogs::DialogResult::Selected) {
                 CopyToBuffer(impl_->project_parent_buf, sizeof(impl_->project_parent_buf), selected_path);
-            } else if (result == FolderBrowseResult::Failed) {
-                SetStatus(error);
+            } else if (result == dialogs::DialogResult::Failed) {
+                SetStatus("Browse failed: " + error_message);
             }
-#else
-            SetStatus("Folder browsing is only available on Windows in this build.");
-#endif
         }
 
         ImGui::PopStyleColor(4);
@@ -1496,29 +1363,24 @@ void AppRuntime::RenderOpenProjectModal() {
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Open Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("Select an af.proj file to open");
-        if (ImGui::Button("Browse...", ImVec2(120.0f, 0.0f))) {
-#ifdef _WIN32
+        ImGui::SetNextItemWidth(330.0f);
+        ImGui::InputText("##open_project_path", impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...", ImVec2(84.0f, 0.0f))) {
             std::string selected_path;
-            std::string error;
-            FolderBrowseResult result = BrowseForProjectManifest(selected_path, error);
-            if (result == FolderBrowseResult::Selected) {
-                std::filesystem::path manifest_path(selected_path);
-                std::string file_name = manifest_path.filename().string();
-                std::transform(file_name.begin(), file_name.end(), file_name.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (file_name != "af.proj") {
-                    SetStatus("Please select an af.proj file.");
-                } else if (impl_->app_state.open_project(selected_path)) {
-                    OpenFirstProjectSacmFile();
-                    impl_->show_open_project_modal = false;
-                    ImGui::CloseCurrentPopup();
-                }
-            } else if (result == FolderBrowseResult::Failed) {
-                SetStatus(error);
+            std::string error_message;
+            const dialogs::DialogResult result = dialogs::BrowseForProjectManifest(
+                impl_->open_project_path_buf, selected_path, error_message);
+            if (result == dialogs::DialogResult::Selected) {
+                CopyToBuffer(impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf), selected_path);
+                TryOpenProjectManifest(selected_path);
+            } else if (result == dialogs::DialogResult::Failed) {
+                SetStatus("Browse failed: " + error_message);
             }
-#else
-            SetStatus("Project browsing is only available on Windows in this build.");
-#endif
+        }
+
+        if (ImGui::Button("Open", ImVec2(110.0f, 0.0f))) {
+            TryOpenProjectManifest(impl_->open_project_path_buf);
         }
         ImGui::Spacing();
 
@@ -1666,7 +1528,8 @@ const parser::AssuranceCase* AppRuntime::GetLoadedCase() const {
 }
 
 void AppRuntime::RenderFrame(bool& done) {
-    if (app::platform::ConsumeCloseRequest()) {
+    if (impl_->close_requested) {
+        impl_->close_requested = false;
         RequestExit(done);
     }
 

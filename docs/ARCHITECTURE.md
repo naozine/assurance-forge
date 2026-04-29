@@ -51,6 +51,10 @@ UI rendering code should avoid depending directly on `app`. If a panel needs to 
 
 This keeps dependencies visible at the call site and preserves the simple immediate-mode style.
 
+## HelloImGui Scope
+
+HelloImGui is used only as a thin platform layer: window creation, event loop, DPI scaling, and macOS bundling. Higher-level HelloImGui features (docking layout, theming, log/INI persistence, status bar, asset image utilities) are intentionally not used so the dependency stays cheap to swap if needed.
+
 ## Core Data
 
 Safety Case Core Guidelines are tracked as the `external/safety-case-core-guidelines` submodule. The build copies `external/safety-case-core-guidelines/data/guidelines.yaml` into each target runtime directory as `data/guidelines.yaml`, and release packaging overlays that file into the shipped `data` folder.

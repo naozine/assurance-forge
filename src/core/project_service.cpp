@@ -1,10 +1,7 @@
 #include "core/project_service.h"
 
+#include "core/sha256.h"
 #include "parser/xml_parser.h"
-
-#define NOMINMAX
-#include <windows.h>
-#include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -45,11 +42,21 @@ std::string Trim(const std::string& value) {
     return std::string(begin, end);
 }
 
+bool MakeUtcTime(std::time_t time, std::tm& utc) {
+#if defined(_WIN32)
+    return gmtime_s(&utc, &time) == 0;
+#else
+    return gmtime_r(&time, &utc) != nullptr;
+#endif
+}
+
 std::string NowUtc() {
     auto now = std::chrono::system_clock::now();
     std::time_t time = std::chrono::system_clock::to_time_t(now);
     std::tm utc{};
-    gmtime_s(&utc, &time);
+    if (!MakeUtcTime(time, utc)) {
+        return "1970-01-01T00:00:00Z";
+    }
     std::ostringstream out;
     out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
     return out.str();
@@ -171,74 +178,18 @@ bool ReadFileBytes(const std::filesystem::path& path, std::vector<unsigned char>
     return true;
 }
 
-std::string HexString(const std::vector<unsigned char>& bytes) {
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (unsigned char byte : bytes) {
-        out << std::setw(2) << static_cast<int>(byte);
-    }
-    return out.str();
-}
-
-bool Sha256Bytes(const unsigned char* data, size_t size, std::string& hash, std::string& error) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash_handle = nullptr;
-
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
-        error = "Could not open SHA-256 provider";
-        return false;
-    }
-
-    DWORD object_length = 0;
-    DWORD result_length = 0;
-    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                          reinterpret_cast<PUCHAR>(&object_length), sizeof(object_length),
-                          &result_length, 0) != 0) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        error = "Could not read SHA-256 object length";
-        return false;
-    }
-
-    DWORD hash_length = 0;
-    if (BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
-                          reinterpret_cast<PUCHAR>(&hash_length), sizeof(hash_length),
-                          &result_length, 0) != 0) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        error = "Could not read SHA-256 hash length";
-        return false;
-    }
-
-    std::vector<unsigned char> object_buffer(object_length);
-    std::vector<unsigned char> hash_buffer(hash_length);
-
-    bool ok = true;
-    if (BCryptCreateHash(algorithm, &hash_handle, object_buffer.data(), object_length, nullptr, 0, 0) != 0) {
-        error = "Could not create SHA-256 hash";
-        ok = false;
-    } else if (BCryptHashData(hash_handle, const_cast<PUCHAR>(data), static_cast<ULONG>(size), 0) != 0) {
-        error = "Could not update SHA-256 hash";
-        ok = false;
-    } else if (BCryptFinishHash(hash_handle, hash_buffer.data(), hash_length, 0) != 0) {
-        error = "Could not finish SHA-256 hash";
-        ok = false;
-    }
-
-    if (hash_handle) BCryptDestroyHash(hash_handle);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-
-    if (!ok) return false;
-    hash = HexString(hash_buffer);
-    return true;
-}
-
 bool Sha256String(const std::string& content, std::string& hash, std::string& error) {
-    return Sha256Bytes(reinterpret_cast<const unsigned char*>(content.data()), content.size(), hash, error);
+    error.clear();
+    hash = Sha256::HexDigest(content);
+    return true;
 }
 
 bool Sha256File(const std::filesystem::path& path, std::string& hash, std::string& error) {
     std::vector<unsigned char> bytes;
     if (!ReadFileBytes(path, bytes, error)) return false;
-    return Sha256Bytes(bytes.data(), bytes.size(), hash, error);
+    error.clear();
+    hash = Sha256::HexDigest(bytes);
+    return true;
 }
 
 size_t FindMatching(const std::string& text, size_t open_pos, char open_char, char close_char) {

@@ -1,10 +1,16 @@
 ﻿cmake_minimum_required(VERSION 3.21)
 project(assurance-forge LANGUAGES C CXX)
 
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+if(MSVC)
+    add_compile_options(/FS)
+endif()
 
 # yaml-cpp 0.8.0 still declares cmake_minimum_required(VERSION 3.4).
 # Raise the policy floor for fetched dependencies without patching their sources.
@@ -19,6 +25,33 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(nlohmann_json)
+
+set(HELLOIMGUI_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
+set(HELLOIMGUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(HELLOIMGUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(HELLOIMGUI_USE_FREETYPE OFF CACHE BOOL "" FORCE)
+set(HELLOIMGUI_USE_GLFW3 ON CACHE BOOL "" FORCE)
+set(HELLOIMGUI_HAS_OPENGL3 ON CACHE BOOL "" FORCE)
+set(HELLOIMGUI_USE_EXTERNAL_JSON ON CACHE BOOL "" FORCE)
+add_subdirectory(external/hello_imgui)
+
+set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(NFD_BUILD_SDL2_TESTS OFF CACHE BOOL "" FORCE)
+set(NFD_BUILD_GLFW3_TESTS OFF CACHE BOOL "" FORCE)
+set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
+set(NFD_WAYLAND OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/nativefiledialog-extended)
+
+set(PICOSHA2_TEST OFF CACHE BOOL "" FORCE)
+set(PICOSHA2_EXAMPLE OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/picosha2)
+
+set(ASSURANCE_FORGE_IMGUI_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/external/hello_imgui/external/imgui
+    ${CMAKE_SOURCE_DIR}/external/hello_imgui/external/imgui/backends
+)
+
+option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 
 # --- YAML ---
 set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -74,26 +107,6 @@ if(NOT TARGET CURL::libcurl AND TARGET libcurl_static)
     add_library(CURL::libcurl ALIAS libcurl_static)
 endif()
 
-# --- ImGui ---
-set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/external/imgui)
-add_library(imgui_core STATIC
-    ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/imgui_draw.cpp
-    ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-)
-target_include_directories(imgui_core PUBLIC
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-)
-
-add_library(imgui_backends STATIC
-    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
-)
-target_link_libraries(imgui_backends PUBLIC imgui_core d3d11 d3dcompiler dxgi)
-
 # --- pugixml ---
 add_subdirectory(external/pugixml)
 
@@ -112,21 +125,7 @@ function(af_copy_guidelines_data target_name)
     )
 endfunction()
 
-# --- Main application ---
-add_executable(assurance-forge WIN32
-    src/ai/ai_claim_review.cpp
-    src/ai/ai_service.cpp
-    src/ai/ai_settings.cpp
-    src/ai/ai_task_runner.cpp
-    src/ai/ai_types.cpp
-    src/ai/http_client.cpp
-    src/ai/libcurl_http_client.cpp
-    src/ai/openai_provider.cpp
-    src/ai/secret_store.cpp
-    src/app/main.cpp
-    src/app/app_runtime.cpp
-    src/app/platform_win32_dx11.cpp
-    src/parser/guidelines_parser.cpp
+set(ASSURANCE_FORGE_SHARED_SOURCES
     src/parser/xml_parser.cpp
     src/ui/panels/welcome_modal.cpp
     src/ui/panels/element_panel.cpp
@@ -151,13 +150,34 @@ add_executable(assurance-forge WIN32
     src/core/problems/problems_manager.cpp
     src/core/project_model.cpp
     src/core/project_service.cpp
+    src/core/sha256.cpp
     src/sacm/sacm_parser.cpp
     src/sacm/sacm_serializer.cpp
 )
-target_include_directories(assurance-forge PRIVATE src)
-target_link_libraries(assurance-forge PRIVATE imgui_core imgui_backends pugixml nlohmann_json::nlohmann_json ${AF_YAML_CPP_TARGET} CURL::libcurl bcrypt ole32 shell32)
+set(ASSURANCE_FORGE_APP_SOURCES
+    src/ai/ai_claim_review.cpp
+    src/ai/ai_service.cpp
+    src/ai/ai_settings.cpp
+    src/ai/ai_task_runner.cpp
+    src/ai/ai_types.cpp
+    src/ai/http_client.cpp
+    src/ai/libcurl_http_client.cpp
+    src/ai/openai_provider.cpp
+    src/ai/secret_store.cpp
+    src/app/main.cpp
+    src/app/app_ui_bootstrap.cpp
+    src/app/app_runtime.cpp
+    src/app/native_file_dialogs.cpp
+    src/parser/guidelines_parser.cpp
+    ${ASSURANCE_FORGE_SHARED_SOURCES}
+)
+
+# --- Main application ---
+hello_imgui_add_app(assurance-forge ${ASSURANCE_FORGE_APP_SOURCES})
+target_include_directories(assurance-forge PRIVATE src ${ASSURANCE_FORGE_IMGUI_INCLUDE_DIRS})
+target_link_libraries(assurance-forge PRIVATE imgui pugixml nfd picosha2 nlohmann_json::nlohmann_json ${AF_YAML_CPP_TARGET} CURL::libcurl)
 if(WIN32)
-    target_link_libraries(assurance-forge PRIVATE advapi32)
+    target_link_libraries(assurance-forge PRIVATE bcrypt advapi32 ole32 shell32)
 endif()
 af_copy_guidelines_data(assurance-forge)
 
@@ -179,6 +199,7 @@ add_executable(tests
     tests/test_sacm_roundtrip.cpp
     tests/test_element_factory.cpp
     tests/test_project_service.cpp
+    tests/test_sha256.cpp
     tests/test_ai_settings.cpp
     tests/test_ai_service.cpp
     tests/test_ai_claim_review.cpp
@@ -201,14 +222,15 @@ add_executable(tests
     src/core/problems/problems_manager.cpp
     src/core/project_model.cpp
     src/core/project_service.cpp
+    src/core/sha256.cpp
     src/ui/gsn/gsn_layout.cpp
     src/sacm/sacm_parser.cpp
     src/sacm/sacm_serializer.cpp
 )
-target_include_directories(tests PRIVATE src)
-target_link_libraries(tests PRIVATE GTest::gtest_main pugixml imgui_core nlohmann_json::nlohmann_json ${AF_YAML_CPP_TARGET} bcrypt)
+target_include_directories(tests PRIVATE src ${ASSURANCE_FORGE_IMGUI_INCLUDE_DIRS})
+target_link_libraries(tests PRIVATE GTest::gtest_main pugixml imgui picosha2 nlohmann_json::nlohmann_json ${AF_YAML_CPP_TARGET} CURL::libcurl)
 if(WIN32)
-    target_link_libraries(tests PRIVATE advapi32)
+    target_link_libraries(tests PRIVATE bcrypt advapi32)
 
     add_custom_command(TARGET tests POST_BUILD
         COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:tests>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:tests>;$<TARGET_FILE_DIR:tests>>"
@@ -217,7 +239,11 @@ if(WIN32)
 endif()
 af_copy_guidelines_data(tests)
 include(GoogleTest)
-gtest_discover_tests(tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+gtest_discover_tests(tests
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    DISCOVERY_MODE PRE_TEST
+)
 add_test(
     NAME GuidelinesDataRuntimeCopy
     COMMAND ${CMAKE_COMMAND} -E compare_files
