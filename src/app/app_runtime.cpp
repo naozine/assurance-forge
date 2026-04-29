@@ -11,6 +11,7 @@
 #endif
 
 #include "app/native_file_dialogs.h"
+#include "app/recent_projects.h"
 
 #include "ai/ai_claim_review.h"
 #include "ai/ai_service.h"
@@ -18,14 +19,18 @@
 #include "ai/libcurl_http_client.h"
 #include "ai/openai_provider.h"
 #include "ai/secret_store.h"
+#include "hello_imgui/hello_imgui.h"
+#include "hello_imgui/hello_imgui_theme.h"
 #include "imgui.h"
 
 #include "core/app_state.h"
 #include "core/element_factory.h"
 #include "core/problems/problems_manager.h"
+#include "core/project_service.h"
 #include "parser/guidelines_parser.h"
 #include "ui/gsn/gsn_adapter.h"
 #include "ui/gsn/gsn_canvas.h"
+#include "ui/localization.h"
 #include "ui/panels/element_panel.h"
 #include "ui/panels/problems_panel.h"
 #include "ui/panels/preferences_panel.h"
@@ -33,7 +38,6 @@
 #include "ui/panels/sacm_viewer_panel.h"
 #include "ui/panels/welcome_modal.h"
 #include "ui/register_views.h"
-#include "ui/theme.h"
 #include "ui/tree_view.h"
 #include "ui/ui_state.h"
 #include "ui/widgets/splitter.h"
@@ -45,6 +49,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace app {
@@ -66,7 +71,8 @@ constexpr float kMinProblemsPanelHeight = 160.0f;
 const ImGuiWindowFlags kPanelFlags = ImGuiWindowFlags_NoMove
                                    | ImGuiWindowFlags_NoResize
                                    | ImGuiWindowFlags_NoCollapse
-                                   | ImGuiWindowFlags_NoBringToFrontOnFocus;
+                                   | ImGuiWindowFlags_NoBringToFrontOnFocus
+                                   | ImGuiWindowFlags_NoSavedSettings;
 
 enum class ProjectFileCreateKind {
     Sacm,
@@ -90,8 +96,39 @@ const char* ProjectFileCreateTitle(ProjectFileCreateKind kind) {
     return "New Project File";
 }
 
-ImVec4 ColorFromU32(ImU32 color) {
-    return ImGui::ColorConvertU32ToFloat4(color);
+void RenderLanguageMenu() {
+    if (!ImGui::BeginMenu(ui::Tr(ui::MessageId::Language))) return;
+
+    const ui::Language current = ui::CurrentLanguage();
+    if (ImGui::MenuItem(ui::Tr(ui::MessageId::English), nullptr, current == ui::Language::English)) {
+        ui::SetCurrentLanguage(ui::Language::English);
+    }
+    if (ImGui::MenuItem(ui::Tr(ui::MessageId::Japanese), nullptr, current == ui::Language::Japanese)) {
+        ui::SetCurrentLanguage(ui::Language::Japanese);
+    }
+
+    ImGui::EndMenu();
+}
+
+void RenderThemeMenu() {
+    if (!ImGui::BeginMenu(ui::Tr(ui::MessageId::Theme))) return;
+
+    HelloImGui::RunnerParams* runner_params = HelloImGui::GetRunnerParams();
+    if (!runner_params) {
+        ImGui::EndMenu();
+        return;
+    }
+
+    for (int i = 0; i < ImGuiTheme::ImGuiTheme_Count; ++i) {
+        auto theme = static_cast<ImGuiTheme::ImGuiTheme_>(i);
+        bool selected = runner_params->imGuiWindowParams.tweakedTheme.Theme == theme;
+        if (ImGui::MenuItem(ImGuiTheme::ImGuiTheme_Name(theme), nullptr, selected)) {
+            runner_params->imGuiWindowParams.tweakedTheme.Theme = theme;
+            ImGuiTheme::ApplyTweakedTheme(runner_params->imGuiWindowParams.tweakedTheme);
+        }
+    }
+
+    ImGui::EndMenu();
 }
 
 std::string LowercaseAscii(std::string value) {
@@ -154,6 +191,30 @@ bool IsProjectManifestPath(const std::filesystem::path& path) {
     return LowercaseAscii(path.filename().string()) == "af.proj";
 }
 
+ui::panels::RecentProjectEntry MakeRecentProjectEntry(const core::AppState& app_state) {
+    ui::panels::RecentProjectEntry entry;
+    if (!app_state.current_project.has_value()) return entry;
+
+    const core::AssuranceProject& project = app_state.current_project.value();
+    entry.name = project.name;
+    entry.path = core::ProjectService::ManifestPath(project).u8string();
+
+    if (!app_state.loaded_case.has_value()) return entry;
+    for (const parser::SacmElement& element : app_state.loaded_case->elements) {
+        const std::string type = LowercaseAscii(element.type);
+        if (type == "claim") {
+            ++entry.claims;
+        } else if (type == "argumentreasoning") {
+            ++entry.strategies;
+        } else if (type == "artifact" || type == "artifactreference") {
+            ++entry.evidence;
+        }
+        if (element.undeveloped) ++entry.undeveloped;
+    }
+
+    return entry;
+}
+
 }  // namespace
 
 struct AppRuntime::Impl {
@@ -203,13 +264,13 @@ struct AppRuntime::Impl {
     bool show_startup_project_window = true;
 
     bool show_create_project_modal = false;
-    bool show_open_project_modal = false;
     bool show_project_file_name_modal = false;
     ProjectFileCreateKind pending_project_file_kind = ProjectFileCreateKind::Sacm;
     char project_name_buf[128] = "MySafetyCase";
     char project_parent_buf[kPathBufferSize] = ".";
     char open_project_path_buf[kPathBufferSize] = "";
     char project_file_name_buf[256] = "main.sacm";
+    std::vector<ui::panels::RecentProjectEntry> recent_projects;
     bool show_save_before_exit_modal = false;
     bool close_requested = false;
 
@@ -221,6 +282,7 @@ struct AppRuntime::Impl {
     std::vector<std::string> pending_remove_ids;
 
     bool show_preferences_window = false;
+    bool show_theme_tweak_window = false;
 
     bool show_ai_review_debug_modal = false;
     ai::AiReviewRequestArtifacts pending_ai_review;
@@ -511,55 +573,55 @@ float AppRuntime::RenderMainMenuBar(bool& done) {
         return 0.0f;
     }
 
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Create Empty Assurance Project")) {
+    if (ImGui::BeginMenu(ui::Tr(ui::MessageId::FileMenu))) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::CreateEmptyProject))) {
             BeginCreateProject();
         }
-        if (ImGui::MenuItem("Open Project")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::OpenProject))) {
             BeginOpenProject();
         }
         ImGui::Separator();
         bool has_project = impl_->app_state.current_project.has_value();
         if (!has_project) ImGui::BeginDisabled();
-        if (ImGui::MenuItem("Save Project")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::SaveProject))) {
             SaveProject();
         }
         if (!has_project) ImGui::EndDisabled();
         ImGui::Separator();
-        if (ImGui::MenuItem("Exit")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::Exit))) {
             RequestExit(done);
         }
         ImGui::EndMenu();
     }
 
-    if (ImGui::BeginMenu("Add")) {
+    if (ImGui::BeginMenu(ui::Tr(ui::MessageId::AddMenu))) {
         bool has_project = impl_->app_state.current_project.has_value();
         if (!has_project) ImGui::BeginDisabled();
-        if (ImGui::MenuItem("New GSN / SACM File")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::NewGsnSacmFile))) {
             BeginCreateProjectSacmFile();
         }
-        if (ImGui::MenuItem("New Evidence Register")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::NewEvidenceRegister))) {
             BeginCreateProjectEvidenceRegister();
         }
-        if (ImGui::MenuItem("New J3377 CAE Register")) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::NewJ3377CaeRegister))) {
             BeginCreateProjectJ3377CaeRegister();
         }
         if (!has_project) ImGui::EndDisabled();
         ImGui::EndMenu();
     }
 
-    if (ImGui::BeginMenu("Edit")) {
-        if (ImGui::MenuItem("Preferences...")) {
+    if (ImGui::BeginMenu(ui::Tr(ui::MessageId::EditMenu))) {
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::Preferences))) {
             impl_->show_preferences_window = true;
         }
         ImGui::EndMenu();
     }
 
-    if (ImGui::BeginMenu("View")) {
+    if (ImGui::BeginMenu(ui::Tr(ui::MessageId::ViewMenu))) {
         ui::UiState& ui_state = ui::GetUiState();
-        ImGui::MenuItem("GSN Canvas", nullptr, &impl_->show_gsn_tab);
-        ImGui::MenuItem("CSE Register", nullptr, &impl_->show_cse_tab);
-        ImGui::MenuItem("Evidence Register", nullptr, &impl_->show_evidence_tab);
+        ImGui::MenuItem(ui::Tr(ui::MessageId::GsnCanvas), nullptr, &impl_->show_gsn_tab);
+        ImGui::MenuItem(ui::Tr(ui::MessageId::CseRegister), nullptr, &impl_->show_cse_tab);
+        ImGui::MenuItem(ui::Tr(ui::MessageId::EvidenceRegister), nullptr, &impl_->show_evidence_tab);
         NormalizeCenterViewSelection(
             impl_->show_gsn_tab,
             impl_->show_cse_tab,
@@ -568,7 +630,17 @@ float AppRuntime::RenderMainMenuBar(bool& done) {
             ui_state.center_view);
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Welcome Screen")) {
+        if (ImGui::BeginMenu(ui::Tr(ui::MessageId::Appearance))) {
+            if (ImGui::MenuItem(ui::Tr(ui::MessageId::ThemeTweaks))) {
+                impl_->show_theme_tweak_window = true;
+            }
+            RenderThemeMenu();
+            RenderLanguageMenu();
+            ImGui::EndMenu();
+        }
+
+        ImGui::Separator();
+        if (ImGui::MenuItem(ui::Tr(ui::MessageId::WelcomeScreen))) {
             impl_->show_startup_project_window = true;
         }
 
@@ -603,6 +675,7 @@ void AppRuntime::RenderPreferencesWindow() {
     model.apiKeyBufferSize = sizeof(impl_->ai_api_key_buf);
     model.modelBuffer = impl_->ai_model_buf;
     model.modelBufferSize = sizeof(impl_->ai_model_buf);
+    model.language = ui::CurrentLanguage();
 
     ui::panels::PreferencesPanelCallbacks callbacks;
     callbacks.save_settings = [this](const ai::AiProviderSettings& settings) {
@@ -651,8 +724,16 @@ void AppRuntime::RenderPreferencesWindow() {
             return service->TestConnection();
         });
     };
+    callbacks.set_language = [](ui::Language language) {
+        ui::SetCurrentLanguage(language);
+    };
 
     ui::panels::ShowPreferencesWindow(impl_->show_preferences_window, model, callbacks);
+}
+
+void AppRuntime::RenderThemeTweaksWindow() {
+    if (!impl_->show_theme_tweak_window) return;
+    HelloImGui::ShowThemeTweakGuiWindow(&impl_->show_theme_tweak_window);
 }
 
 void AppRuntime::RenderSplitters(float display_w, float content_h, float left_w, float center_w, float top_y) {
@@ -785,7 +866,7 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
             ImGuiTabItemFlags gsn_flags = (impl_->force_center_tab_selection && ui_state.center_view == ui::CenterView::GsnCanvas)
                                           ? ImGuiTabItemFlags_SetSelected
                                           : 0;
-            if (ImGui::BeginTabItem("GSN Canvas", nullptr, gsn_flags)) {
+            if (ImGui::BeginTabItem(ui::Tr(ui::MessageId::GsnCanvas), nullptr, gsn_flags)) {
                 ui_state.center_view = ui::CenterView::GsnCanvas;
                 ui::ElementContextActions actions = MakeElementContextActions(*this);
                 ui::gsn::ShowGsnCanvasContent(ui_state, GetLoadedCase(), actions);
@@ -797,7 +878,7 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
             ImGuiTabItemFlags cse_flags = (impl_->force_center_tab_selection && ui_state.center_view == ui::CenterView::CseRegister)
                                           ? ImGuiTabItemFlags_SetSelected
                                           : 0;
-            if (ImGui::BeginTabItem("CSE Register", nullptr, cse_flags)) {
+            if (ImGui::BeginTabItem(ui::Tr(ui::MessageId::CseRegister), nullptr, cse_flags)) {
                 ui_state.center_view = ui::CenterView::CseRegister;
                 if (impl_->app_state.active_project_file_role == core::ProjectFileRole::J3377CaeRegister) {
                     ImGui::TextWrapped("J3377 CAE register file: %s",
@@ -814,7 +895,7 @@ void AppRuntime::RenderCenterPanel(float center_x, float center_w, float content
             ImGuiTabItemFlags evidence_flags = (impl_->force_center_tab_selection && ui_state.center_view == ui::CenterView::EvidenceRegister)
                                                ? ImGuiTabItemFlags_SetSelected
                                                : 0;
-            if (ImGui::BeginTabItem("Evidence Register", nullptr, evidence_flags)) {
+            if (ImGui::BeginTabItem(ui::Tr(ui::MessageId::EvidenceRegister), nullptr, evidence_flags)) {
                 ui_state.center_view = ui::CenterView::EvidenceRegister;
                 if (impl_->app_state.active_project_file_role == core::ProjectFileRole::EvidenceRegister) {
                     ImGui::TextWrapped("Evidence register file: %s",
@@ -1194,28 +1275,59 @@ void AppRuntime::RenderRemoveConfirmModal() {
 }
 
 void AppRuntime::RenderStartupProjectWindow() {
-    // TODO: Populate from persisted recent-projects list. Placeholder data shown for now.
-    static const std::vector<ui::panels::RecentProjectEntry> kDemoRecent = {
-        { "Open Autonomy Safety Case", "data/oasc-ja.xml", 42, 9, 16, 3 },
-    };
     ui::panels::WelcomeModalCallbacks callbacks{
         [this]() { BeginCreateProject(); },
         [this]() { ShowNotImplementedModal("Create Assurance Project from Template"); },
         [this]() { BeginOpenProject(); },
         [this]() { ShowNotImplementedModal("Import SACM"); },
-        [this](const ui::panels::RecentProjectEntry& /*entry*/) {
-            BeginOpenProject();
+        [this](const ui::panels::RecentProjectEntry& entry) {
+            if (!TryOpenProjectManifest(entry.path)) {
+                RemoveRecentProject(impl_->recent_projects, entry.path);
+            }
         },
     };
-    ui::panels::ShowWelcomeModal(impl_->show_startup_project_window, kDemoRecent, callbacks);
+    ui::panels::ShowWelcomeModal(impl_->show_startup_project_window, impl_->recent_projects, callbacks);
 }
 
 void AppRuntime::BeginCreateProject() {
-    impl_->show_create_project_modal = true;
+    std::string selected_path;
+    std::string error_message;
+    const dialogs::DialogResult result = dialogs::BrowseForProjectParentFolder(
+        impl_->project_parent_buf, selected_path, error_message);
+    if (result == dialogs::DialogResult::Selected) {
+        CopyToBuffer(impl_->project_parent_buf, sizeof(impl_->project_parent_buf), selected_path);
+        if (impl_->project_name_buf[0] == '\0') {
+            CopyToBuffer(impl_->project_name_buf, sizeof(impl_->project_name_buf), "MySafetyCase");
+        }
+        impl_->show_create_project_modal = true;
+    } else if (result == dialogs::DialogResult::Failed) {
+        SetStatus("Browse failed: " + error_message);
+    }
 }
 
 void AppRuntime::BeginOpenProject() {
-    impl_->show_open_project_modal = true;
+    std::string default_path = impl_->open_project_path_buf;
+    if (default_path.empty() && !impl_->recent_projects.empty()) {
+        default_path = impl_->recent_projects.front().path;
+    }
+
+    std::string selected_path;
+    std::string error_message;
+    const dialogs::DialogResult result = dialogs::BrowseForProjectManifest(
+        default_path, selected_path, error_message);
+    if (result == dialogs::DialogResult::Selected) {
+        CopyToBuffer(impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf), selected_path);
+        TryOpenProjectManifest(selected_path);
+    } else if (result == dialogs::DialogResult::Failed) {
+        SetStatus("Browse failed: " + error_message);
+    }
+}
+
+void AppRuntime::TouchCurrentProjectRecent() {
+    ui::panels::RecentProjectEntry entry = MakeRecentProjectEntry(impl_->app_state);
+    if (!entry.path.empty()) {
+        TouchRecentProject(impl_->recent_projects, std::move(entry));
+    }
 }
 
 void AppRuntime::BeginCreateProjectSacmFile() {
@@ -1300,7 +1412,8 @@ bool AppRuntime::TryOpenProjectManifest(const std::string& selected_path) {
         return false;
     }
     OpenFirstProjectSacmFile();
-    impl_->show_open_project_modal = false;
+    TouchCurrentProjectRecent();
+    CopyToBuffer(impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf), selected_path);
     ImGui::CloseCurrentPopup();
     return true;
 }
@@ -1310,38 +1423,19 @@ void AppRuntime::RenderCreateProjectModal() {
 
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Create Empty Assurance Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        const ui::Theme& theme = ui::GetTheme();
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ColorFromU32(theme.surface_3));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ColorFromU32(ui::WithAlpha(theme.surface_3, 0.90f)));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ColorFromU32(ui::WithAlpha(theme.accent, 0.28f)));
-        ImGui::PushStyleColor(ImGuiCol_Border, ColorFromU32(theme.border_strong));
-
         ImGui::TextUnformatted("Project name");
         ImGui::SetNextItemWidth(420.0f);
         ImGui::InputText("##project_name", impl_->project_name_buf, sizeof(impl_->project_name_buf));
 
         ImGui::TextUnformatted("Parent location");
-        ImGui::SetNextItemWidth(330.0f);
-        ImGui::InputText("##project_parent", impl_->project_parent_buf, sizeof(impl_->project_parent_buf));
-        ImGui::SameLine();
-        if (ImGui::Button("Browse...", ImVec2(84.0f, 0.0f))) {
-            std::string selected_path;
-            std::string error_message;
-            const dialogs::DialogResult result = dialogs::BrowseForProjectParentFolder(
-                impl_->project_parent_buf, selected_path, error_message);
-            if (result == dialogs::DialogResult::Selected) {
-                CopyToBuffer(impl_->project_parent_buf, sizeof(impl_->project_parent_buf), selected_path);
-            } else if (result == dialogs::DialogResult::Failed) {
-                SetStatus("Browse failed: " + error_message);
-            }
-        }
+        ImGui::TextDisabled("%s", impl_->project_parent_buf);
 
-        ImGui::PopStyleColor(4);
         ImGui::Spacing();
 
         if (ImGui::Button("Create", ImVec2(110.0f, 0.0f))) {
             if (impl_->app_state.create_empty_project(impl_->project_name_buf, impl_->project_parent_buf)) {
                 OpenFirstProjectSacmFile();
+                TouchCurrentProjectRecent();
                 impl_->show_create_project_modal = false;
                 ImGui::CloseCurrentPopup();
             }
@@ -1357,59 +1451,15 @@ void AppRuntime::RenderCreateProjectModal() {
     }
 }
 
-void AppRuntime::RenderOpenProjectModal() {
-    if (!impl_->show_open_project_modal) return;
-
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Open Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Select an af.proj file to open");
-        ImGui::SetNextItemWidth(330.0f);
-        ImGui::InputText("##open_project_path", impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf));
-        ImGui::SameLine();
-        if (ImGui::Button("Browse...", ImVec2(84.0f, 0.0f))) {
-            std::string selected_path;
-            std::string error_message;
-            const dialogs::DialogResult result = dialogs::BrowseForProjectManifest(
-                impl_->open_project_path_buf, selected_path, error_message);
-            if (result == dialogs::DialogResult::Selected) {
-                CopyToBuffer(impl_->open_project_path_buf, sizeof(impl_->open_project_path_buf), selected_path);
-                TryOpenProjectManifest(selected_path);
-            } else if (result == dialogs::DialogResult::Failed) {
-                SetStatus("Browse failed: " + error_message);
-            }
-        }
-
-        if (ImGui::Button("Open", ImVec2(110.0f, 0.0f))) {
-            TryOpenProjectManifest(impl_->open_project_path_buf);
-        }
-        ImGui::Spacing();
-
-        if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
-            impl_->show_open_project_modal = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    } else if (impl_->show_open_project_modal) {
-        ImGui::OpenPopup("Open Project");
-    }
-}
-
 void AppRuntime::RenderProjectFileNameModal() {
     if (!impl_->show_project_file_name_modal) return;
 
     const char* title = ProjectFileCreateTitle(impl_->pending_project_file_kind);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        const ui::Theme& theme = ui::GetTheme();
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ColorFromU32(theme.surface_3));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ColorFromU32(ui::WithAlpha(theme.surface_3, 0.90f)));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ColorFromU32(ui::WithAlpha(theme.accent, 0.28f)));
-        ImGui::PushStyleColor(ImGuiCol_Border, ColorFromU32(theme.border_strong));
-
         ImGui::TextUnformatted("File name");
         ImGui::SetNextItemWidth(420.0f);
         ImGui::InputText("##project_file_name", impl_->project_file_name_buf, sizeof(impl_->project_file_name_buf));
-        ImGui::PopStyleColor(4);
         ImGui::Spacing();
 
         if (ImGui::Button("Create", ImVec2(110.0f, 0.0f))) {
@@ -1527,6 +1577,14 @@ const parser::AssuranceCase* AppRuntime::GetLoadedCase() const {
     return &impl_->app_state.loaded_case.value();
 }
 
+void AppRuntime::LoadRecentProjectsPreference(const std::string& content) {
+    impl_->recent_projects = app::LoadRecentProjectsPreference(content);
+}
+
+std::string AppRuntime::RecentProjectsPreferenceJson() const {
+    return app::SaveRecentProjectsPreference(impl_->recent_projects);
+}
+
 void AppRuntime::RenderFrame(bool& done) {
     if (impl_->close_requested) {
         impl_->close_requested = false;
@@ -1581,12 +1639,12 @@ void AppRuntime::RenderFrame(bool& done) {
     RenderElementPropertiesPanel(center_x, center_w, right_w, content_h, top_y);
 
     RenderPreferencesWindow();
+    RenderThemeTweaksWindow();
     RenderAiReviewDebugModal();
 
     RenderNotImplementedModal();
     RenderRemoveConfirmModal();
     RenderCreateProjectModal();
-    RenderOpenProjectModal();
     RenderProjectFileNameModal();
     RenderProjectLoadReportModal();
     RenderSaveBeforeExitModal(done);

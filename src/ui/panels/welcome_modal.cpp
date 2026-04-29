@@ -4,6 +4,7 @@
 #include "ui/gsn/gsn_canvas.h"
 #include "ui/theme.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace ui::panels {
@@ -128,13 +129,19 @@ void ShowWelcomeModal(bool& is_open,
         ImGui::CloseCurrentPopup();
     };
 
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(920.0f, 560.0f), ImGuiCond_Always);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 viewport_center(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                           viewport->WorkPos.y + viewport->WorkSize.y * 0.5f);
+    ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImVec2 viewport_size = viewport->WorkSize;
+    ImGui::SetNextWindowSize(ImVec2(std::min(1080.0f, std::max(360.0f, viewport_size.x - 40.0f)),
+                                    std::min(680.0f, std::max(360.0f, viewport_size.y - 40.0f))),
+                             ImGuiCond_Always);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 10.0f));
 
-    if (ImGui::BeginPopupModal("Welcome!", &is_open, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal("Welcome!", &is_open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
         const ui::Theme& theme = ui::GetTheme();
 
         ImGui::SetWindowFontScale(kWelcomeBodyFontScale);
@@ -153,7 +160,7 @@ void ShowWelcomeModal(bool& is_open,
 
         ImGui::Dummy(ImVec2(0.0f, 20.0f));
 
-        if (ImGui::BeginTable("WelcomeLayout", 2, ImGuiTableFlags_SizingStretchProp, ImVec2(0.0f, 390.0f))) {
+        if (ImGui::BeginTable("WelcomeLayout", 2, ImGuiTableFlags_SizingStretchProp, ImVec2(0.0f, 500.0f))) {
             ImGui::TableSetupColumn("StartColumn", ImGuiTableColumnFlags_WidthStretch, 0.48f);
             ImGui::TableSetupColumn("WalkthroughColumn", ImGuiTableColumnFlags_WidthStretch, 0.52f);
             ImGui::TableNextRow();

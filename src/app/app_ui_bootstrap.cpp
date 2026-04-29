@@ -1,37 +1,40 @@
 #include "app/app_ui_bootstrap.h"
 
 #include "hello_imgui/hello_imgui.h"
+#include "hello_imgui/imgui_default_settings.h"
 #include "imgui.h"
 
 #include "ui/gsn/gsn_canvas.h"
-#include "ui/theme.h"
 
 namespace app {
 
 void ConfigureImGuiConfig() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = nullptr;
-}
-
-void ConfigureImGuiStyle() {
-    ImGui::StyleColorsDark();
-    ui::ApplyImGuiStyle();
 }
 
 void ConfigureImGuiFonts() {
     constexpr float kFontSize = 15.0f;
     ImGuiIO& io = ImGui::GetIO();
-    const ImWchar* jp_ranges = io.Fonts->GetGlyphRangesJapanese();
+
+    HelloImGui::ImGuiDefaultSettings::LoadDefaultFont_WithFontAwesomeIcons();
+    ImFont* default_font = io.Fonts->Fonts.empty() ? nullptr : io.Fonts->Fonts[0];
+    if (default_font != nullptr) {
+        io.FontDefault = default_font;
+    }
 
     HelloImGui::FontLoadingParams regular_params;
+    regular_params.mergeToLastFont = true;
     regular_params.fontConfig.PixelSnapH = true;
-    regular_params.fontConfig.GlyphRanges = jp_ranges;
+    regular_params.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesJapanese();
     ImFont* regular_font = HelloImGui::LoadFont("fonts/NotoSansJP-Regular.otf", kFontSize, regular_params);
+    if (default_font == nullptr && regular_font != nullptr) {
+        io.FontDefault = regular_font;
+    }
 
     HelloImGui::FontLoadingParams bold_params;
     bold_params.fontConfig.PixelSnapH = true;
-    bold_params.fontConfig.GlyphRanges = jp_ranges;
+    bold_params.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesJapanese();
     ImFont* bold_font = HelloImGui::LoadFont("fonts/NotoSansJP-Bold.otf", kFontSize, bold_params);
 
     ui::gsn::g_BoldFont = bold_font;

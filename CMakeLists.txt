@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/FS)
+    add_compile_options(/FS /utf-8)
 endif()
 
 # yaml-cpp 0.8.0 still declares cmake_minimum_required(VERSION 3.4).
@@ -142,6 +142,7 @@ set(ASSURANCE_FORGE_SHARED_SOURCES
     src/ui/tree_view.cpp
     src/ui/register_views.cpp
     src/ui/ui_state.cpp
+    src/ui/localization.cpp
     src/ui/theme.cpp
     src/core/app_state.cpp
     src/core/assurance_tree.cpp
@@ -168,6 +169,7 @@ set(ASSURANCE_FORGE_APP_SOURCES
     src/app/app_ui_bootstrap.cpp
     src/app/app_runtime.cpp
     src/app/native_file_dialogs.cpp
+    src/app/recent_projects.cpp
     src/parser/guidelines_parser.cpp
     ${ASSURANCE_FORGE_SHARED_SOURCES}
 )
@@ -206,6 +208,8 @@ add_executable(tests
     tests/test_openai_provider.cpp
     tests/test_ai_task_runner.cpp
     tests/test_guidelines_parser.cpp
+    tests/test_localization.cpp
+    tests/test_recent_projects.cpp
     src/ai/ai_service.cpp
     src/ai/ai_claim_review.cpp
     src/ai/ai_settings.cpp
@@ -214,6 +218,7 @@ add_executable(tests
     src/ai/http_client.cpp
     src/ai/openai_provider.cpp
     src/ai/secret_store.cpp
+    src/app/recent_projects.cpp
     src/parser/guidelines_parser.cpp
     src/parser/xml_parser.cpp
     src/core/assurance_tree.cpp
@@ -224,6 +229,7 @@ add_executable(tests
     src/core/project_service.cpp
     src/core/sha256.cpp
     src/ui/gsn/gsn_layout.cpp
+    src/ui/localization.cpp
     src/sacm/sacm_parser.cpp
     src/sacm/sacm_serializer.cpp
 )
