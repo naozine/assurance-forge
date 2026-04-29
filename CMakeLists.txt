@@ -12,6 +12,20 @@ if(MSVC)
     add_compile_options(/FS /utf-8)
 endif()
 
+option(ENABLE_COVERAGE "Enable code coverage instrumentation (Linux/GCC only)" OFF)
+if(ENABLE_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "ENABLE_COVERAGE requires GCC (got ${CMAKE_CXX_COMPILER_ID}).")
+    endif()
+    message(STATUS "Code coverage instrumentation enabled (GCC ${CMAKE_CXX_COMPILER_VERSION})")
+    add_compile_options(--coverage -O0)
+    add_link_options(--coverage)
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
+        message(STATUS "  GCC >= 14 detected, enabling -fcondition-coverage (MC/DC)")
+        add_compile_options(-fcondition-coverage)
+    endif()
+endif()
+
 # yaml-cpp 0.8.0 still declares cmake_minimum_required(VERSION 3.4).
 # Raise the policy floor for fetched dependencies without patching their sources.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
